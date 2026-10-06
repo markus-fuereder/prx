@@ -623,7 +623,12 @@ def ci_of(rollup):
 
 def layer_ok(pr):
     """One native-stack layer is ready to land: open, not draft, no conflict,
-    approved, CI green (or no checks). The bottom must also be CLEAN."""
+    approved, CI green (or no checks), and GitHub doesn't report it BLOCKED,
+    DIRTY or DRAFT — a stack merge applies the stack base's rules to every
+    layer, so a layer's BLOCKED (e.g. a code-owner review its own files need)
+    blocks the stack even when reviewDecision, computed against the layer's
+    unprotected base branch, says nothing. UNKNOWN passes: GitHub computes it
+    lazily. The bottom must also be CLEAN."""
     commits = pr["commits"]["nodes"]
     rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
     approved = pr.get("reviewDecision") == "APPROVED" or (
@@ -631,6 +636,7 @@ def layer_ok(pr):
             rv["state"] == "APPROVED" for rv in pr["latestOpinionatedReviews"]["nodes"]))
     return (pr["state"] == "OPEN" and not pr["isDraft"] and approved
             and pr.get("mergeable") != "CONFLICTING"
+            and pr.get("mergeStateStatus") not in ("BLOCKED", "DIRTY", "DRAFT")
             and ci_of(rollup)[0] in ("GREEN", "-"))
 
 
@@ -3048,10 +3054,13 @@ def selftest():
                 "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}}
     node.update(mergeStateStatus="BLOCKED", stackEntry={"position": 2}, stack={
         "number": 99, "size": 2, "entries": {"nodes": [
-            {"position": 2, "pullRequest": layer(7, "BLOCKED")},
+            {"position": 2, "pullRequest": layer(7, "UNKNOWN")},
             {"position": 1, "pullRequest": layer(6, "CLEAN")}]}})
     r = brow()
     assert r["action"] == "land" and [ly["number"] for ly in r["stack"]["layers"]] == [6, 7], r
+    node["stack"]["entries"]["nodes"][0]["pullRequest"]["mergeStateStatus"] = "BLOCKED"
+    assert brow()["action"] == "chase"  # a layer needs a code-owner review — no land
+    node["stack"]["entries"]["nodes"][0]["pullRequest"]["mergeStateStatus"] = "UNKNOWN"
     node["stack"]["entries"]["nodes"].append(
         {"position": 0, "pullRequest": dict(layer(5, "BLOCKED"), state="MERGED")})
     assert brow()["action"] == "land"  # merged layers below don't count

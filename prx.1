@@ -204,7 +204,9 @@ default branch is not an action \(em see the detail card and \fBM\fR;
 (\fBM\fR);
 .B land
 = any layer of a native GitHub stack whose unmerged layers are all approved,
-green, not drafts and not conflicting, the bottom one clean (\fBM\fR on any of
+green, not drafts and not conflicting, none reported \fIBLOCKED\fR by GitHub
+(e.g. a code-owner review that a layer's files need \(em the stack merge applies
+the base branch's rules to every layer), the bottom one clean (\fBM\fR on any of
 them lands the whole stack in one go); while one layer isn't ready, no layer
 says land and the bottom one merges like any PR;
 .B stack
