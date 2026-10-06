@@ -3,7 +3,7 @@
 prx \- TUI for open GitHub pull request status across repos and authors
 .SH SYNOPSIS
 .B prx
-[\fB--config\fR \fIpath\fR] [\fB--plain\fR | \fB--json\fR] [\fB--all\fR] [\fB--by\fR repo|author]
+[\fB--config\fR \fIpath\fR] [\fB--plain\fR | \fB--json\fR] [\fB--all\fR] [\fB--by\fR stack|repo|author|change]
 .SH DESCRIPTION
 .B prx
 lists open GitHub pull requests for the repositories and authors defined in a
@@ -59,9 +59,10 @@ now. Default: week. In the TUI, cycle with \fBl\fR instead. Fetching always
 covers a month, so the TUI toggle is instant; PRs with no activity for over 30
 days are never shown.
 .TP
-.BI --by " stack|repo|author"
+.BI --by " stack|repo|author|change"
 Sort for \fB--plain\fR output. \fIstack\fR sorts by repo and groups stacked
-PRs under their root. Default: stack.
+PRs under their root; \fIchange\fR sorts by last change, newest first.
+Default: stack.
 .TP
 .BI --refresh " seconds"
 TUI auto-sync interval; 0 disables. Overrides the \fIrefresh\fR config key.
@@ -153,8 +154,10 @@ Plain/JSON: all reviewers with suffix \fB+\fR approved, \fB?\fR pending,
 Days since the PR was created, e.g. \fB3d\fR, \fB21d\fR (capped at 99d).
 .TP
 .B CHNG
-Days since the PR last changed (GitHub \fIupdatedAt\fR: commits, reviews,
-comments, state changes), same format as \fBDAYS\fR. This is the timestamp the
+Time since the PR last changed (GitHub \fIupdatedAt\fR: commits, reviews,
+comments, state changes): hours under a day (\fB0h\fR\(en\fB23h\fR), then days
+like \fBDAYS\fR (\fB1d\fR, capped at \fB99d\fR). The detail card's
+\fIupdated … ago\fR uses the same format. This is the timestamp the
 time window filters on. Hidden in compact view.
 .TP
 .B BRANCH
@@ -289,7 +292,8 @@ Cycle the author filter: all, then each configured author.
 Cycle the last window: day, week, month (PRs updated in the last 1/7/30 days).
 .TP
 .B b
-Cycle the sort: stack (default), repo, author.
+Cycle the sort: stack (default), repo, author, change (last change, newest
+first \(em what just moved on top).
 .TP
 .B /
 Fuzzy search by PR number, branch, and title. The search operates on exactly

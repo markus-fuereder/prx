@@ -82,14 +82,16 @@ def iso_days_ago(days):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
 
 
-def age_str(created):
-    """Days since a timestamp, max 3 chars: 3d, 21d, capped at 99d."""
+def age_str(created, hours=False):
+    """Days since a timestamp, max 3 chars: 3d, 21d, capped at 99d. With
+    hours, under a day shows hours instead: 0h…23h."""
     try:
-        days = int((time.time() - calendar.timegm(
-            time.strptime(created, "%Y-%m-%dT%H:%M:%SZ"))) // 86400)
+        secs = time.time() - calendar.timegm(time.strptime(created, "%Y-%m-%dT%H:%M:%SZ"))
     except (ValueError, TypeError):
         return "-"
-    return f"{min(max(days, 0), 99)}d"
+    if hours and secs < 86400:
+        return f"{max(int(secs // 3600), 0)}h"
+    return f"{min(max(int(secs // 86400), 0), 99)}d"
 
 
 def since_str(ts):
@@ -1124,7 +1126,7 @@ def row_segments(row, compact=False):
         (f"{row['author']:<7.7} ", "blue" if row.get("mine") else "value"),
         *reviewer_segments(row),
         (f"{age_str(row['created']):>4} ", "label"),
-        (f"{age_str(row['updated']):>4} ", "label"),
+        (f"{age_str(row['updated'], hours=True):>4} ", "label"),
         (f"{br}{row['branch']:<15.15} ", "label"),
         (row["title"], "value"),
     ]
@@ -1148,7 +1150,7 @@ def format_row(row):
     return (f"{row['repo']:<8.8} #{row['number']:<6}{row['author']:<10.10} "
             f"{row['status']:<8}{row['review']:<9}{row['ci']:<8}{row['action']:<9}"
             f"{reviewers:<{PLAIN_REVW - 1}.{PLAIN_REVW - 2}}{age_str(row['created']):>4} "
-            f"{age_str(row['updated']):>4} {row['branch']:<23.22} {row['title']}")
+            f"{age_str(row['updated'], hours=True):>4} {row['branch']:<23.22} {row['title']}")
 
 
 def scroll_window(n, body, top, sel):
@@ -1168,7 +1170,12 @@ def scroll_window(n, body, top, sel):
             return top, up, down
 
 
+SORTS = ("stack", "repo", "author", "change")
+
+
 def sort_rows(rows, by):
+    if by == "change":  # last change, newest first
+        return sorted(rows, key=lambda r: r["updated"], reverse=True)
     rows = sorted(rows, key=lambda r: r["updated"], reverse=True)  # newest first
     return sorted(rows, key=lambda r: (r[by], r["repo"]))  # stable: keeps recency order
 
@@ -1359,7 +1366,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
     saved = load_state(state_path)
     if str(cfg.get("restore_filters", "true")).lower() != "false":
         window = saved.get("window") if saved.get("window") in WINDOWS else window
-        by = saved.get("by") if saved.get("by") in ("stack", "repo", "author") else by
+        by = saved.get("by") if saved.get("by") in SORTS else by
         state_f = saved.get("state") if saved.get("state") in STATE_FILTERS else state_f
         org_f = saved.get("org") if saved.get("org") in org_list else None
         repo_f = saved.get("repo") if saved.get("repo") in repos_of(org_f) else None
@@ -1856,7 +1863,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                     (f"repo     {row['repo']} · {row['org']}", "label"),
                     (f"author   {row['author']} (@{row['login']})", "label"),
                     (f"age      created {age_str(row['created'])} ago · "
-                     f"updated {age_str(row['updated'])} ago", "label"),
+                     f"updated {age_str(row['updated'], hours=True)} ago", "label"),
                 ]),
                 ("status", [(f"{icon(row['status'])} {row['status'].upper()}",
                              STATUS_COLOR.get(row["status"], "value"))]),
@@ -2869,7 +2876,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             state_f = cyc(STATE_FILTERS, state_f, step)
             cursor, top = 0, 0
         elif key in (ord("b"), ord("B")):
-            by = cyc(("stack", "repo", "author"), by, step)
+            by = cyc(SORTS, by, step)
             cursor, top = 0, 0
         elif key in (ord("l"), ord("L")):
             window = cyc(WINDOWS, window, step)
@@ -2959,6 +2966,11 @@ def selftest():
     assert gh_transient("HTTP 404: Not Found") is None and gh_transient("HTTP 401: Bad credentials") is None
     assert age_str(iso_days_ago(21)) == "21d" and age_str(iso_days_ago(0)) == "0d"
     assert age_str(iso_days_ago(500)) == "99d" and age_str("") == "-"
+    assert age_str(iso_days_ago(5 / 24), hours=True) == "5h" and age_str(iso_days_ago(0), hours=True) == "0h"
+    assert age_str(iso_days_ago(1), hours=True) == "1d" and age_str(iso_days_ago(5 / 24)) == "0d"
+    srt = [{"number": n, "updated": u, "repo": "r", "author": "a"} for n, u in
+           ((1, "2026-10-02T00:00:00Z"), (2, "2026-09-01T00:00:00Z"), (3, "2026-10-05T00:00:00Z"))]
+    assert [r["number"] for r in sort_rows(srt, "change")] == [3, 1, 2]  # newest change first
     now = time.time()
     assert since_str(now) == "0s" and since_str(now - 59) == "59s"
     assert since_str(now - 60) == "1m" and since_str(now - 3599) == "59m"
@@ -3224,8 +3236,9 @@ def main():
     p.add_argument("--window", choices=WINDOWS, default="week",
                    help="time window: only PRs updated in the last day/week/month, "
                         "1/7/30 days from now (TUI: cycle with l; default: week)")
-    p.add_argument("--by", choices=["stack", "repo", "author"], default="stack",
-                   help="sort for --plain output; 'stack' = repo sort with stacked PRs grouped "
+    p.add_argument("--by", choices=SORTS, default="stack",
+                   help="sort for --plain output; 'stack' = repo sort with stacked PRs grouped, "
+                        "'change' = last change, newest first "
                         "(TUI: cycle with b; default: stack)")
     p.add_argument("--refresh", type=int, metavar="SEC",
                    help="TUI auto-refresh interval in seconds, 0 disables (default: config 'refresh' key, else 300)")
