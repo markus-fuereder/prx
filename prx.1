@@ -1,0 +1,504 @@
+.TH PRX 1 "2026-09-02" "prx" "User Commands"
+.SH NAME
+prx \- TUI for open GitHub pull request status across repos and authors
+.SH SYNOPSIS
+.B prx
+[\fB--config\fR \fIpath\fR] [\fB--plain\fR | \fB--json\fR] [\fB--all\fR] [\fB--by\fR repo|author]
+.SH DESCRIPTION
+.B prx
+lists open GitHub pull requests for the repositories and authors defined in a
+YAML config file in one flat table, sortable by repo or author. For each PR it
+shows the repo, PR number, author, CI state, reviewers with their review
+state, a recommended action, the head branch, and the title. The TUI uses Nerd
+Font glyphs (octicons), GitHub-style: a pull-request/merge icon colored by
+status (open green, draft grey, merged purple, closed red), a filled CI dot
+(green/yellow/red, grey when no checks), per-reviewer check marks (green
+approved, grey pending, red x for changes requested), and a branch icon.
+A Nerd Font is recommended for the TUI. On first run prx asks whether the
+sample glyphs render; the answer is saved as \fInerd_font\fR in the config. With
+\fInerd_font: false\fR the TUI uses plain text instead (status \fB○ · ● ×\fR,
+CI \fB✓ ✗ ~ ?\fR, filter labels led by their trigger key, decorative icons
+dropped); toggle it anytime in the \fB,\fR settings. \fB--plain\fR and
+\fB--json\fR output is always plain text. Data is fetched via the
+.BR gh (1)
+CLI (GraphQL API), which must be installed and authenticated.
+.PP
+Without flags it opens an interactive curses TUI. With
+.B --plain
+or
+.B --json
+it prints once to stdout and exits, which is the mode intended for scripts and
+AI agents.
+.SH OPTIONS
+.TP
+.BI --config " path"
+Config file to use. Default: \fI~/.config/prx/prx.yaml\fR.
+.TP
+.B --plain
+Print the table to stdout instead of starting the TUI.
+.TP
+.B --json
+Print all PRs and fetch errors as JSON to stdout instead of starting the TUI.
+.TP
+.B --all
+Show PRs from all authors. By default, if authors are configured, only PRs by
+those authors are shown.
+.TP
+.BI --state " all|open|merged|closed"
+State filter for \fB--plain\fR/\fB--json\fR output. \fIopen\fR includes
+drafts. Default: all. In the TUI, cycle with \fBs\fR instead.
+.TP
+.BI --author " name"
+Only show PRs by this author (config short name or GitHub login) in
+\fB--plain\fR/\fB--json\fR output. In the TUI, cycle through configured
+authors with \fBa\fR instead.
+.TP
+.BI --window " day|week|month"
+Only show PRs updated within the last 1/7/30 days, a moving window relative to
+now. Default: week. In the TUI, cycle with \fBl\fR instead. Fetching always
+covers a month, so the TUI toggle is instant; PRs with no activity for over 30
+days are never shown.
+.TP
+.BI --by " stack|repo|author"
+Sort for \fB--plain\fR output. \fIstack\fR sorts by repo and groups stacked
+PRs under their root. Default: stack.
+.TP
+.BI --refresh " seconds"
+TUI auto-sync interval; 0 disables. Overrides the \fIrefresh\fR config key.
+Default: config value, else 300. Fetches run in the background; a spinner in
+the title bar indicates activity while the current list stays on screen.
+A sync only fetches what the current filters show (repo, state, last).
+Widening a filter (state, last, repo) triggers a sync 3 seconds after the
+last cycle keypress to fill in rows not yet fetched.
+.TP
+.B --clear-cache
+Delete the TUI's PR cache (see CACHE) and exit.
+.TP
+.B --help
+Show usage summary.
+.SH CONFIGURATION
+YAML file with two lists. \fIname\fR is the short display name; \fIurl\fR is
+the GitHub repository URL; a repo's optional \fIicon\fR names a Nerd Font
+glyph shown before its name in the TUI; \fItag\fR is the author's GitHub
+login. Icon names cover common languages, frameworks, and tech (angular,
+react, vue, nodejs, python, go, rust, docker, kubernetes, aws, postgres,
+server, database, ...); the full list is in the comment at the bottom of the
+example config. An unknown value is rendered verbatim, so a raw glyph also
+works. Default: the GitHub repo octicon.
+Optional top-level keys: \fIrefresh\fR sets the TUI auto-sync interval in
+seconds (default 300, 0 disables); \fIrefresh_waiting\fR sets the fast
+refresh interval for rows marked waiting with \fBw\fR (default 30, 0
+disables). The TUI persists its filter state (org, last, sort, state,
+repo, author, auto on/off) and the waiting marks to \fIstate.json\fR next to
+the config file and restores them on start; \fIrestore_filters: false\fR
+and/or \fIrestore_waiting: false\fR disable the hydration (saving always
+happens).
+.PP
+.nf
+refresh: 300
+refresh_waiting: 30
+repos:
+  - name: backend
+    url: https://github.com/acme/backend
+  - name: web
+    url: https://github.com/acme/web-app
+authors:
+  - name: robin
+    tag: robin-gh-login
+  - name: quinn
+    tag: quinn-codes
+.fi
+.SH COLUMNS
+.TP
+.B REPO
+Configured short name of the repository.
+.TP
+.B PR
+Pull request number.
+.TP
+.B AUTHOR
+Author short name from \fIauthors\fR, else the GitHub login. Your own PRs
+(the entry with \fIme: true\fR) show in blue.
+.TP
+.B STATUS
+draft, open, merged, or closed.
+.TP
+.B REVIEW
+(\fB--plain\fR/\fB--json\fR)
+.B pending
+(review required),
+.B reviewed
+(approved), or
+.B changes
+(changes requested).
+.TP
+.B REV
+TUI: three fixed slots at the same position in every row, color-coded.
+Verdict: red thumb-down with the change-requester count if anyone requested
+changes (\fB-N\fR without a nerd font), else green thumb-up with the approval
+count (\fB+N\fR; approvers are never named, your own approval included).
+Pending: person-with-clock with the number of open review requests, people and
+teams together (\fB?N\fR; grey, orange when any is a team or an outsider — not
+a configured author; teams would need the read:org scope to be named). A zero
+count shows dark grey (\fB+0\fR, \fB?0\fR). Last, \fBme\fR with your own
+state when you are a reviewer: eye when your review is requested (\fB?me\fR,
+blue highlight), thumb-down when you requested changes (\fB-me\fR, red),
+thumb-up when you approved (\fB+me\fR, green). "You" is the author entry with
+\fIme: true\fR; you are never counted in the change or pending slots. Counts
+cap at 9. Example: \fB+2 ?1 ?me\fR. The detail card names every reviewer.
+Plain/JSON: all reviewers with suffix \fB+\fR approved, \fB?\fR pending,
+\fB-\fR changes requested; JSON carries \fIdecision\fR and \fIext_review\fR.
+.TP
+.B DAYS
+Days since the PR was created, e.g. \fB3d\fR, \fB21d\fR (capped at 99d).
+.TP
+.B CHNG
+Days since the PR last changed (GitHub \fIupdatedAt\fR: commits, reviews,
+comments, state changes), same format as \fBDAYS\fR. This is the timestamp the
+time window filters on. Hidden in compact view.
+.TP
+.B BRANCH
+Head branch of the PR.
+.TP
+.B CI
+TUI: one icon for the loudest state of the head commit's checks — red filled
+✗-circle if any failed, yellow radio dot if any running, grey hollow circle if
+only queued, grey cancel sign if a check was cancelled (CI never finished), green
+outlined ✓-circle if all passed, grey \- when no checks.
+Plain/JSON: the combined state as GREEN/YELLOW/RED/CANCELLED (\- when no
+checks), plus a \fIchecks\fR field [passed, failed, running, queued, cancelled]
+in JSON. A cancelled check is no result, not a failure: CANCELLED unless
+something failed or still runs. A check that ran
+more than once on the same commit (a re-run, a label event) counts only with
+its newest run: per GitHub Actions workflow only its newest run counts (a run
+cancelled before its matrix expanded has different job names), then per
+check name its newest start \(em the way GitHub's PR page shows it; GitHub's own combined status still counts the stale runs, so a PR whose
+old run failed and whose re-run passed is green here and on the PR page.
+.TP
+.B ACTION
+The next move (icon + word in the TUI), first match wins:
+.B review
+= your review is requested (highlighted; requires \fIme: true\fR);
+.B rebase
+= merge conflict;
+.B fix ci
+= a check failed;
+.B rerun
+= CI was cancelled and nothing failed: no code to fix, the run has to run again
+(\fBM\fR re-runs the cancelled jobs with \fBgh run rerun --failed\fR after a
+\fBy\fR confirm; it starts CI others see and that costs Actions minutes);
+.B address
+= changes requested;
+.B ready
+= still a draft: mark it ready for review;
+.B update
+= its chain or stack is out of date where it matters: a layer is behind its
+parent PR's branch (a lower layer moved), or GitHub reports it \fIBEHIND\fR
+(the repository requires up-to-date branches). Every layer of that chain says
+update instead of \fIland\fR, \fIstack\fR, \fIhold\fR, \fIblocked\fR,
+\fImerge\fR, \fIwait\fR or \fIchase\fR (\fBM\fR updates it; see MERGING);
+never while a layer of the chain has a merge conflict. Being behind only the
+default branch is not an action \(em see the detail card and \fBM\fR;
+.B merge
+= approved, CI green, clean, based on the default branch — go merge
+(\fBM\fR);
+.B land
+= any layer of a native GitHub stack whose unmerged layers are all approved,
+green, not drafts and not conflicting, the bottom one clean (\fBM\fR on any of
+them lands the whole stack in one go); while one layer isn't ready, no layer
+says land and the bottom one merges like any PR;
+.B stack
+= a plain stack (PRs chained by base branch, not yet a native GitHub stack)
+and \fBgh-stack\fR is installed: every ready layer that would otherwise say
+\fImerge\fR (the bottom) or \fIhold\fR (the layers above) says stack instead,
+because merging the bottom alone forces rebases above it (\fBM\fR links the
+whole chain; see MERGING). Only for the squash and rebase merge methods: with
+merge commits the layers above stay valid, so the chain keeps
+\fImerge\fR/\fIhold\fR. Not for trees: when a PR has two open PRs on its
+branch, those rows keep \fImerge\fR/\fIhold\fR;
+.B hold
+= otherwise mergeable, but stacked on another open PR's branch: merge that one
+first (without \fBgh-stack\fR installed);
+.B blocked
+= otherwise mergeable, but based on a branch that is neither the default branch
+nor another PR's: merge in the browser;
+.B wait
+= CI running, nothing to do yet;
+.B chase
+= only reviews are missing, go ping;
+.B done
+= merged/closed.
+.SH STACKED PRS
+A PR whose base branch is the head branch of another visible PR is part of a
+stack. In the default \fIstack\fR sort, members are grouped directly under
+their root and marked in a purple rail column left of the PR number:
+\fB▪\fR root, \fB├\fR member, \fB└\fR last member. In repo/author sort, rows keep pure sort order and every
+stack member shows a plain \fB▪\fR instead. Native GitHub stacks keep the solid
+purple rail; plain stacks (not linked yet, see the \fIstack\fR action) show a
+dashed grey one: \fB▫\fR, \fB┆\fR, \fB╰\fR. If the parent is not visible
+(merged, filtered out), the child appears as a normal row. \fB--json\fR output
+carries the \fIbase\fR branch per PR.
+.SH TUI KEYS
+Every cycling key cycles backwards with Shift (O, S, R, A, L, B). The
+footer shows only the essentials; \fB?\fR opens a modal listing every key with
+a short description. It closes on \fBq q\fR only, like quitting; pressing any
+other key highlights the line that key belongs to for about half a second, so
+the modal doubles as a key trainer. A shifted cycle key (\fBShift+r\fR and
+friends) highlights two lines: its own and the \fBShift\fR line. Auto sync
+and the waiting schedule keep running while it is open.
+.P
+The footer's right end shows the most practical key for the selected row,
+always as the key (never an icon): \fBM\fR with what it does (\fImerge\fR,
+\fIland\fR or \fIstack\fR) when \fBM\fR acts on the row; else \fBw\fR
+\fIwatch\fR while its CI is running and it isn't watched yet; else
+\fB↵\fR \fIdetails\fR.
+.TP
+.B q q
+Quit — pressed twice within 2 seconds. The first press shows a
+"press q again to quit" prompt in the footer; any other key withdraws it.
+Ctrl+C quits immediately.
+.TP
+.B Esc
+Sync everything the current filters show.
+.TP
+.B 0
+Reset state, last, repo, author, search, and sort to their defaults —
+the org filter is kept.
+.TP
+.B o
+Cycle the organization filter: all, then each organization derived from the
+configured repo URLs. With "all" selected and more than one organization
+configured, the table is split into one section per organization, each with
+its own column header and PR count. Switching to an organization clears a
+repo filter from another organization.
+.TP
+.B s
+Cycle the state filter: all, open (includes drafts), merged, closed. No
+refetch needed; merged/closed rows show \fB-\fR as action.
+.TP
+.B r
+Cycle the repo filter: all, then each configured repository \(em only the
+selected organization's repositories when the org filter is set.
+.TP
+.B a
+Cycle the author filter: all, then each configured author.
+.TP
+.B l
+Cycle the last window: day, week, month (PRs updated in the last 1/7/30 days).
+.TP
+.B b
+Cycle the sort: stack (default), repo, author.
+.TP
+.B /
+Fuzzy search by PR number, branch, and title. The search operates on exactly
+the rows the current filters show — it never fetches or widens anything;
+widen the last window with \fBl\fR first if needed. Matching adapts to input
+length: digit and ticket queries under 3
+digits match as prefixes (typing never blanks the table); from 3 digits on,
+\fI116\fR / \fIMIT-116\fR / \fImit116\fR matches exactly that ticket reference
+(never ABC-1160 or ABC-161) or a PR number prefix; anything else is a
+case-insensitive substring match. Matched text is highlighted in the rows
+(config \fIsearch_highlight: false\fR disables it), and the selection jumps to
+the best-scoring match while typing (exact PR number beats exact ticket beats
+prefix; \fIsearch_select_best: false\fR disables it). Typing edits
+the query live; \fBEnter\fR keeps the filter, \fBEsc\fR clears it; \fB/\fR
+re-edits a kept filter. \fB0\fR (reset) also clears it.
+.TP
+.B ,
+Open the settings modal: edit \fIrefresh\fR, \fIrefresh_waiting\fR,
+\fIrestore_filters\fR, \fIrestore_waiting\fR, \fIsearch_highlight\fR, and two
+entries opening sub-modals — \fIrepos\fR and \fIauthors\fR. Changes are written
+to the config file immediately; the refresh intervals apply live. Enter edits a
+number (digits, enter commits, esc cancels), space/enter toggles a boolean, esc
+closes.
+.IP
+\fIrepos\fR opens the repo import modal, the only way in. Navigation is drill-in
+with the arrow keys: right goes deeper, left goes back. Pick an organization
+(or your own account), then check/uncheck its repositories with \fBspace\fR.
+Right arrow on a repo row focuses its cells: first the 2-char short name (type
+to overwrite), right again the icon (up/down steps through the named icons,
+typing filters them). Short name and icon are prefilled from the repo name and
+its primary language. \fBEnter\fR at row level writes the selection to the
+config file (checked repos of that org are added or updated, unchecked ones
+removed; other orgs untouched) and refetches. \fBEsc\fR cancels.
+.IP
+\fIauthors\fR manages author entries: short name, GitHub login tag, and the
+\fIme\fR flag; space sets me exclusively, n adds, x deletes, enter saves to the
+config, esc cancels.
+.TP
+.B c
+Toggle compact columns: only status, PR number, CI, branch, title, and action.
+Terminals narrower than 95 columns switch to the compact view automatically;
+the title column always shrinks and grows with the remaining space, all other
+columns are fixed width.
+.TP
+.B h
+Hold for hints: while \fBh\fR is held, every filter label and footer item
+shows the key that triggers it instead of its icon, reverting about half a
+second after release. Uses terminal key-repeat, so it works over ssh/mosh.
+\fIshow_filter_keys: true\fR in the config shows the keys permanently (default
+false; also in the \fB,\fR settings modal).
+.TP
+.B Loading line
+While a fetch for a wider scope runs (start-up, or a filter change that needs
+data not loaded yet, including the 3 s debounce before it starts), a dark grey
+line under the last row shows a spinner, the scope, and the repos still in
+flight, e.g. \fI⠼ loading month · FE, DE\fR. Plain syncs don't show it.
+.TP
+.B Tab
+Toggle auto sync on/off (the top bar shows \fIauto\fR or \fImanual\fR).
+Next to it, \fIlast sync 42s ago\fR gives the age of the last completed
+fetch. One unit, largest that fits: \fBs\fR under a minute, then \fBm\fR,
+\fBh\fR, \fBd\fR, \fBw\fR, capped at \fB54w\fR.
+Manual mode still allows \fBEsc\fR and does not affect the waiting schedule.
+.TP
+.B w
+Toggle "waiting" on the selected PR: waiting PRs are refreshed individually on
+the fast \fIrefresh_waiting\fR schedule (default every 30 seconds) in addition
+to the sync. Each waiting tick also fetches the newest open PRs per
+repo in scope, so newly opened PRs show up between syncs; rows drop
+out on their own once they age past the time window. The PR number turns purple while waiting is on.
+A waiting mark clears itself as soon as the PR is merged or closed.
+.TP
+.B Space
+Refresh the selected PR only, leaving the rest of the list untouched. The row
+shows the fetch spinner while it runs. No-op while a sync of that
+repository is already in flight.
+.TP
+.B M
+Merge, land, stack, update or re-run the selected PR, after a fresh check and
+a \fBy\fR confirm; see MERGING. Also in the detail card. \fBM\fR does what the
+action says when it is \fImerge\fR, \fIland\fR, \fIstack\fR, \fIupdate\fR or
+\fIrerun\fR; on any other row of
+a plain chain (with \fBgh-stack\fR installed; not a tree) it links the chain,
+whatever the action says \(em a chain can be linked before it is reviewed;
+and on a row whose chain is only behind the default branch it updates it
+(see MERGING). Nothing is offered while a layer of the chain has a conflict.
+The footer's right end shows what \fBM\fR does on the selected row, e.g.
+\fBM\fR \fIstack\fR (see TUI KEYS for the other hints there).
+.TP
+.B y / Y
+Yank (copy to the clipboard) the selected PR's number (\fB#123\fR) or link.
+The footer confirms with \fIcopied …\fR. Uses \fBpbcopy\fR, \fBwl-copy\fR or
+\fBxclip\fR, whichever exists. Also works in the detail card.
+.TP
+.B j / k / arrows
+Move selection. When rows don't fit, the first or last visible line turns into
+a dark grey \fI↑ N more\fR / \fI↓ N more\fR marker for the rows hidden in that
+direction; the list scrolls so the selection never sits under a marker.
+.TP
+.B Enter
+Open a detail card for the selected PR. Sections, in order:
+about (base/head branch, plus \fIbehind N\fR when the base has N commits the
+head lacks; repo/org, author, age), status, stack (only when the
+PR is part of a stack; current row marked), reviews (decision and per-reviewer
+state), comments (review threads: open, resolved, total \(em plain
+conversation comments can't be resolved and are not counted), CI check counts, and action (the next move with its reason). All from data already fetched. \fBj\fR/\fBk\fR
+or the arrow keys move to the previous/next row without leaving the card.
+\fBEnter\fR opens the PR in the browser (the card stays open), \fBSpace\fR
+refetches the PR the card is showing, \fBw\fR toggles
+waiting for it (the number turns purple), \fBM\fR merges, lands or stacks it
+(see MERGING; only shown when \fBM\fR does something on the PR), and
+\fBEsc\fR closes (keeping the row you landed on selected). The card updates live as watch or refresh data
+arrives; a spinner in the top-left border marks a fetch in flight.
+.SH MERGING
+\fBM\fR (main view or detail card) refetches the PR and recomputes its action; only a
+fresh \fImerge\fR, \fIland\fR or \fIstack\fR (see \fBM\fR under TUI KEYS)
+continues. A confirm dialog then shows the
+merge method (the repository's \fIviewerDefaultMergeMethod\fR, e.g.
+\fIsquash into development\fR), whether the branch will be deleted (the
+repository's \fIdeleteBranchOnMerge\fR), a merge queue note, and warnings:
+PRs that are not yours (the author entry with \fIme: true\fR), and plain
+stacked children that need \fBgit rebase --onto\fR afterwards. \fBy\fR
+confirms, any other key cancels.
+.P
+\fImerge\fR runs \fBgh pr merge\fR with \fB--match-head-commit\fR pinned to
+the refetched head, so a push after the check makes the merge fail instead of
+merging unseen commits. \fB--admin\fR is never used.
+.P
+\fIland\fR runs \fBgh stack merge\fR (the \fBgh-stack\fR extension) with
+\fBGH_REPO\fR set and the stack number, merging every unmerged layer of the
+stack in one all-or-nothing operation, whichever layer \fBM\fR started on. Without the extension a dialog offers \fBb\fR (merge
+the bottom layer instead) and \fBc\fR (copy
+\fBgh extension install github/gh-stack\fR); any other key cancels.
+.P
+\fIstack\fR walks the chain live on GitHub, so rows hidden by the time window
+or filters still count: down through each PR's base branch to the first PR
+whose base has no open PR, then up through the open PRs based on each head
+branch. A PR with two open PRs on its branch is a tree, which a stack can't
+hold: prx refuses and names it. The confirm dialog lists the chain bottom to
+top with its base, PRs already in a stack (\fBlink\fR adds the rest to it),
+PRs that are not yours, and drafts (they stay drafts). \fBy\fR runs
+\fBgh stack link --base\fR \fIbottom's base\fR with the PR URLs and
+\fBGH_REPO\fR set: URLs never resolve as branch names (which would be pushed)
+or stack numbers, and the pinned base keeps \fBlink\fR from retargeting the
+bottom PR to the default branch. Every layer is refreshed afterwards, so the
+rows turn into \fIland\fR once they are ready.
+.P
+The bottom of a chain offers the other path as a one-key escape. When the
+stack dialog opens on a ready bottom whose action is \fIstack\fR, \fBm\fR
+merges only that PR (the merge dialog follows, with its \fIrebase --onto\fR
+warning). When the merge dialog opens on a chain bottom that can be linked
+(merge-commit repositories keep \fImerge\fR there), \fBs\fR links the chain
+instead.
+.P
+\fIupdate\fR brings the chain through the PR up to date, bottom to top, with
+GitHub's update-branch operation (\fBupdatePullRequestBranch\fR). Chains
+and stacks are always rebased: GitHub's stacked PRs rely on rebasing, and a
+merge commit in a layer leaves the stack needing \fBgh stack rebase\fR. A
+single PR gets a merge commit, unless the repository lands with rebase. The
+dialog says which, and warns that a rebase rewrites every branch, naming PRs
+that are not yours. It walks the chain live like \fIstack\fR, refuses
+up front when a layer has a merge conflict (showing the local fix, see below), and waits for each layer to
+stop being behind before updating the next one (GitHub does not restack the
+layers above by itself). The first failure stops the run, without rollback;
+the result names what was updated, what failed and why, and what was left
+untouched. Every layer is refreshed afterwards. prx can't resolve a merge
+conflict: when one blocks the update (up front or partway), a dialog shows
+the commands to fix it locally \(em \fBgh stack checkout\fR \fIN\fR,
+\fBgh stack rebase\fR, fix, \fBgh stack push\fR for a native stack, a plain
+\fBgit rebase\fR otherwise \(em and \fBc\fR copies them. The detail card of
+a row whose action is \fIrebase\fR lists the same commands. The merge, land and stack
+dialogs offer \fBu\fR (update first) whenever the chain is behind and has no
+conflict, so any open PR can be updated. Behind counts come from one
+\fBcompare\fR request per repository per sync (and per refresh);
+PRs from forks are not checked.
+.SH CACHE
+The TUI keeps one JSON file per repository in
+\fI${XDG_CACHE_HOME:-~/.cache}/prx/\fR (named by the SHA-1 of
+\fIowner/repo\fR). At start-up it restores the cached rows at once — the top
+bar reads \fIrestored 2h ago\fR until the first sync finishes — then syncs.
+Merged PRs are final, so MERGED is delta-synced: paging stops at the last
+sync (minus 5 minutes) when an earlier sync already covered the window.
+OPEN and CLOSED always get a full sync, because CI results and merge state
+change without touching a PR's \fIupdatedAt\fR. Entries older than 30 days are
+pruned; a query change (new fields) discards the old files automatically.
+\fB--plain\fR and \fB--json\fR never read or write the cache. Clear it with
+\fBprx --clear-cache\fR or \fIclear cache\fR in the \fB,\fR settings modal
+(which starts a full sync). Deleting the folder by hand is always safe.
+Terms (sync, full sync, delta sync, refresh, restore): see \fIGLOSSARY.md\fR.
+.SH FILES
+.TP
+.I ~/.config/prx/prx.yaml
+Configuration (see \fB--config\fR).
+.TP
+.I ~/.config/prx/state.json
+Filters and waiting marks, next to the config file.
+.TP
+.I ${XDG_CACHE_HOME:-~/.cache}/prx/*.json
+PR cache, one file per repository; disposable.
+.SH EXIT STATUS
+0 on success; 1 if a repo failed to fetch in \fB--plain\fR mode, or on config
+errors.
+.SH EXAMPLES
+.TP
+Interactive TUI:
+.B prx
+.TP
+Machine-readable snapshot for an agent:
+.B prx --json
+.TP
+Everyone's PRs sorted by author:
+.B prx --plain --all --by author
+.SH SEE ALSO
+.BR gh (1)

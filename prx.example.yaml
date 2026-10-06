@@ -1,0 +1,34 @@
+# prx config — copy to ~/.config/prx/prx.yaml
+refresh: 300  # TUI auto-refresh seconds, 0 = off
+refresh_waiting: 30  # fast refresh for rows marked waiting ('w'), 0 = off
+restore_filters: true  # restore filters/sort/auto from the last session
+restore_waiting: true  # restore 'waiting' marks from the last session
+search_highlight: true  # highlight search matches in the rows
+search_select_best: true  # jump the selection to the best match while typing
+show_filter_keys: false  # show the cycle key in the filter labels (or hold p to peek)
+nerd_font: true  # use nerd font icons; false = plain text (asked once on first run)
+repos:
+  - name: backend
+    url: https://github.com/acme/backend
+    icon: nodejs  # optional, shown before the name in the TUI; see prx(1) for names
+  - name: web
+    url: https://github.com/acme/web-app
+authors:
+  - name: robin
+    tag: robin-gh-login
+    me: true  # marks you: your name is highlighted when your review is requested
+  - name: quinn
+    tag: quinn-codes
+
+# Available icon names (icon: <name>):
+# 󰚲 angular  󰜈 react  󰡄 vue   svelte   nextjs   nuxt   electron  󰛦 typescript
+# 󰌞 javascript  󰎙 nodejs   nestjs   deno  󰌠 python  󰬷 java  󱈙 kotlin  󰛥 swift
+# 󰟓 go  󱘗 rust  󰴭 ruby   rails  󰌟 php  󰫐 laravel   django   flask  󰌛 csharp  󰪮
+# dotnet  󰙲 cpp  󰙱 c  󰲒 haskell   scala   elixir   erlang  󰢱 lua   perl  󰟔 r
+# dart   flutter  󱆃 bash  󰌝 html  󰌜 css  󰟬 sass  󱏿 tailwind  󰡷 graphql  󰡨
+# docker  󱃾 kubernetes  󱁢 terraform  󱂚 ansible   jenkins  󰸏 aws  󰠅 azure  󱇶
+# gcloud  󰌽 linux  󰀵 apple  󰖳 windows  󰀲 android  󰊢 git  󰊤 github  󰮠 gitlab  󰂨
+# bitbucket  󰛷 npm   postgres   mysql   mongodb   redis  󰥧 firebase   kafka
+# rabbitmq   nginx  󰖴 wordpress  󰚯 unity  󰐿 raspberrypi   arduino  󰖟 web  󰍹
+# monitor  󰲋 app  󰄡 mobile  󰒋 server  󰆼 database  󱂛 api  󰒓 cog  󰘚 chip  󰘧
+# lambda  󰅟 cloud  󰚩 robot  󰳏 repo  󰂺 book  󰏗 package

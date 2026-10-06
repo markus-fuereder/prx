@@ -1,0 +1,3266 @@
+#!/usr/bin/env python3
+"""prx — GitHub PR status TUI. See prx(1) or --help."""
+import argparse
+import calendar
+import concurrent.futures
+import curses
+import hashlib
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+
+CONFIG_DEFAULT = os.path.expanduser("~/.config/prx/prx.yaml")
+
+QUERY = """
+query($owner:String!,$name:String!,$state:PullRequestState!,$after:String){
+  repository(owner:$owner,name:$name){
+    pullRequests(states:[$state], first:50, after:$after,
+        orderBy:{field:UPDATED_AT,direction:DESC}){
+      pageInfo{hasNextPage endCursor}
+      nodes{...prF}
+    }
+  }
+}
+"""
+
+# check runs carry name, workflow and start so stale re-runs can be dropped (ci_of)
+CONTEXTS = """contexts(first:100){nodes{
+      __typename
+      ... on CheckRun{name status conclusion startedAt
+        checkSuite{workflowRun{runNumber databaseId workflow{name}}}}
+      ... on StatusContext{state}
+    }}"""
+
+PR_QUERY = """
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){pullRequest(number:$number){...prF id
+    stack{entries(first:20){nodes{position pullRequest{
+      number state isDraft reviewDecision mergeable mergeStateStatus author{login}
+      latestOpinionatedReviews(first:10){nodes{state}}
+      commits(last:1){nodes{commit{statusCheckRollup{state CONTEXTS}}}}}}}}}}
+}
+""".replace("CONTEXTS", CONTEXTS)
+
+FRAGMENT = """
+fragment prF on PullRequest{
+  number title url state isDraft headRefName baseRefName updatedAt createdAt
+  headRefOid isMergeQueueEnabled isCrossRepository
+  author{login}
+  repository{defaultBranchRef{name} viewerDefaultMergeMethod deleteBranchOnMerge}
+  baseRef{associatedPullRequests(states:[OPEN],first:1){nodes{number}}}
+  stackEntry{position}
+  stack{number size}
+  reviewDecision
+  reviewThreads(first:100){totalCount nodes{isResolved}}
+  mergeable
+  mergeStateStatus
+  reviewRequests(first:10){nodes{requestedReviewer{
+    ... on User{login} ... on Bot{login}}}}
+  latestOpinionatedReviews(first:10){nodes{state author{login}}}
+  commits(last:1){nodes{commit{statusCheckRollup{
+    state
+    CONTEXTS
+  }}}}
+}
+""".replace("CONTEXTS", CONTEXTS)
+QUERY += FRAGMENT
+PR_QUERY += FRAGMENT
+FRAGMENT_SHA = hashlib.sha1(FRAGMENT.encode()).hexdigest()  # cache invalidation key
+
+WINDOWS = ("day", "week", "month")
+WINDOW_DAYS = {"day": 1, "week": 7, "month": 30}
+
+
+def iso_days_ago(days):
+    # gh timestamps are "...Z" UTC; same format makes string comparison valid
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+
+
+def age_str(created):
+    """Days since a timestamp, max 3 chars: 3d, 21d, capped at 99d."""
+    try:
+        days = int((time.time() - calendar.timegm(
+            time.strptime(created, "%Y-%m-%dT%H:%M:%SZ"))) // 86400)
+    except (ValueError, TypeError):
+        return "-"
+    return f"{min(max(days, 0), 99)}d"
+
+
+def since_str(ts):
+    """Age of the last sync, one unit, max 3 chars: 42s, 3m, 2h, 6d, 54w."""
+    s = max(0, int(time.time() - ts))
+    for step, unit, cap in ((60, "s", 60), (60, "m", 60), (24, "h", 24),
+                            (7, "d", 7), (54, "w", 54)):
+        if s < cap:
+            return f"{s}{unit}"
+        s //= step
+    return "54w"
+
+
+# ponytail: YAML-subset parser (lists of flat key: value maps, comments, quotes).
+# Swap for PyYAML if the config ever needs nesting/anchors.
+def parse_config(text):
+    cfg, section, item = {"repos": [], "authors": []}, None, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith(" "):
+            if line.endswith(":"):
+                section = line[:-1].strip()
+                cfg.setdefault(section, [])
+            elif ":" in line:
+                k, v = line.split(":", 1)
+                cfg[k.strip()] = v.strip().strip("'\"")
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            item = {}
+            cfg[section].append(item)
+            stripped = stripped[2:]
+        if ":" in stripped and item is not None:
+            k, v = stripped.split(":", 1)
+            item[k.strip()] = v.strip().strip("'\"")
+    return cfg
+
+
+def repo_slug(url):
+    return "/".join(url.rstrip("/").removesuffix(".git").split("/")[-2:])
+
+
+# ponytail: one global cap on in-flight gh reads. GitHub GraphQL is bound by
+# server CPU time per minute, so more slots cause 403s, not faster syncs.
+GH_SLOTS = threading.BoundedSemaphore(12)
+GH_TRIES = 3
+GH_TIMEOUT = 60  # s per gh call; GitHub itself gives up after ~10 s with a 502/504
+
+
+def gh_transient(stderr):
+    """'limit' for the secondary rate limit, None for other 4xx (a retry would
+    fail the same way), else 'retry' — 5xx, timeouts, truncated JSON."""
+    if re.search(r"secondary rate limit|HTTP 429", stderr, re.I):
+        return "limit"
+    if re.search(r"HTTP 4\d\d|Could not resolve", stderr):
+        return None
+    return "retry"
+
+
+def gh_read(args):
+    """Run a read-only gh command under GH_SLOTS, retrying transient failures
+    with jittered backoff. Never use this for mutations: a retry could repeat them."""
+    for attempt in range(GH_TRIES):
+        with GH_SLOTS:
+            try:
+                out = subprocess.run(["gh"] + args, capture_output=True, text=True,
+                                     timeout=GH_TIMEOUT)
+            except subprocess.TimeoutExpired:  # a hung connection: kill gh, retry
+                out = subprocess.CompletedProcess(args, 124, "", f"gh timed out after {GH_TIMEOUT}s")
+        kind = out.returncode and gh_transient(out.stderr)
+        if not kind or attempt == GH_TRIES - 1:
+            return out
+        # GitHub asks for at least a minute after a secondary rate limit
+        time.sleep((60 if kind == "limit" else 2 ** attempt) * random.uniform(1, 1.5))
+
+
+def gh_err(out):
+    return (out.stderr.strip().splitlines() or ["gh failed"])[-1]
+
+
+def fetch_page(owner, name, state, after):
+    """One page (50) of one PR state, newest first. Returns (nodes, next_cursor, err)."""
+    args = ["api", "graphql", "-f", f"query={QUERY}", "-f", f"owner={owner}",
+            "-f", f"name={name}", "-f", f"state={state}"]
+    if after:
+        args += ["-f", f"after={after}"]
+    out = gh_read(args)
+    if out.returncode != 0:
+        return None, None, gh_err(out)
+    prs = json.loads(out.stdout)["data"]["repository"]["pullRequests"]
+    nxt = prs["pageInfo"]["endCursor"] if prs["pageInfo"]["hasNextPage"] else None
+    nodes = prs["nodes"]
+    # stack layers are too heavy for the list query (GitHub 504s): fetch them
+    # per PR, only for open stack layers, where `land` depends on them
+    upper = [i for i, n in enumerate(nodes)
+             if n.get("stack") and n["state"] == "OPEN"]
+    if upper:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(upper)) as pool:
+            fulls = pool.map(lambda i: fetch_pr_node(owner, name, nodes[i]["number"])[0], upper)
+            for i, full in zip(upper, fulls):
+                nodes[i] = full or nodes[i]
+    return nodes, nxt, None
+
+
+MAX_PAGES = 12  # ponytail: 600 PRs/state/repo cap; raise if a repo outgrows it
+
+
+def fetch_state(owner, name, state, cutoff):
+    """Page through one PR state until past the cutoff."""
+    nodes, after = [], None
+    for _ in range(MAX_PAGES):
+        page, after, err = fetch_page(owner, name, state, after)
+        if err:
+            return None, err
+        nodes += page
+        if not after or (page and page[-1]["updatedAt"] < cutoff):
+            break
+    return nodes, None
+
+
+def gh_json(args):
+    out = gh_read(args)
+    if out.returncode != 0:
+        return None, gh_err(out)
+    return json.loads(out.stdout), None
+
+
+GH_STACK_INSTALL = "gh extension install github/gh-stack"
+
+
+def gh_stack_installed():
+    return subprocess.run(["gh", "stack", "--help"], capture_output=True).returncode == 0
+
+
+STACK_LINK = False  # gh-stack installed: plain chains get `stack` (set once in main)
+M_ACTIONS = ("merge", "land", "stack", "update", "rerun")  # actions M acts on
+
+CHILDREN_QUERY = """
+query($owner:String!,$name:String!,$base:String!){
+  repository(owner:$owner,name:$name){
+    pullRequests(baseRefName:$base, states:[OPEN], first:3){nodes{number}}}
+}
+"""
+
+
+def fetch_children(owner, name, branch):
+    """Open PR numbers based on `branch`, or (None, err)."""
+    out = gh_read(["api", "graphql", "-f", f"query={CHILDREN_QUERY}", "-f", f"owner={owner}",
+                   "-f", f"name={name}", "-f", f"base={branch}"])
+    if out.returncode != 0:
+        return None, gh_err(out)
+    nodes = json.loads(out.stdout)["data"]["repository"]["pullRequests"]["nodes"]
+    return [n["number"] for n in nodes], None
+
+
+def walk_chain(number, parent_of, children_of, limit=20):
+    """Live plain chain through PR `number`, bottom to top: down through each
+    PR's parent, then up through children. Returns (numbers, err); a PR with
+    two open children is a tree, which a stack can't hold."""
+    bottom, seen = number, {number}
+    while True:
+        up, err = parent_of(bottom)
+        if err:
+            return None, err
+        if up is None:
+            break
+        if up in seen or len(seen) >= limit:
+            return None, "chain loops or is too long"
+        bottom = up
+        seen.add(up)
+    chain = [bottom]
+    while True:
+        kids, err = children_of(chain[-1])
+        if err:
+            return None, err
+        if len(kids) > 1:
+            return None, f"#{chain[-1]} has {len(kids)} open PRs on it — a stack must be linear"
+        if not kids:
+            return chain, None
+        if kids[0] in chain or len(chain) >= limit:
+            return None, "chain loops or is too long"
+        chain.append(kids[0])
+
+
+def linkable(row):
+    """In a plain chain gh stack link can take: open, not a native stack, not
+    a tree, with a parent PR or open PRs on its branch."""
+    return (STACK_LINK and row["status"] in ("open", "draft") and not row.get("stack")
+            and not row.get("tree") and bool(row.get("parent_pr") or row.get("kids")))
+
+
+def fetch_behind(owner, name, nodes):
+    """Set node["_behind"]: commits on its base branch its head lacks, from one
+    aliased compare request per 100 open same-repo PRs. Nodes the answer
+    misses get None; a failed request leaves the old counts."""
+    todo = [n for n in nodes if n.get("state") == "OPEN" and not n.get("isCrossRepository")]
+    for i in range(0, len(todo), 100):
+        chunk = todo[i:i + 100]
+        parts = " ".join(
+            f'p{n["number"]}:ref(qualifiedName:{json.dumps("refs/heads/" + n["baseRefName"])})'
+            f'{{compare(headRef:{json.dumps("refs/heads/" + n["headRefName"])}){{behindBy}}}}'
+            for n in chunk)
+        out = gh_read(["api", "graphql", "-f", "query={repository(owner:%s,name:%s){%s}}"
+                       % (json.dumps(owner), json.dumps(name), parts)])
+        try:  # a deleted head branch errors per alias, the rest still answers
+            data = json.loads(out.stdout)["data"]["repository"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        for n in chunk:
+            n["_behind"] = (((data or {}).get(f'p{n["number"]}') or {}).get("compare") or {}).get("behindBy")
+
+
+def carry_behind(cached, nodes):
+    """Keep the last known behind count on refetched nodes until the next
+    compare (same head commit only)."""
+    for n in nodes:
+        old = cached.get(str(n["number"]))
+        if old and "_behind" in old and "_behind" not in n and old.get("headRefOid") == n.get("headRefOid"):
+            n["_behind"] = old["_behind"]
+
+
+def fix_steps(stack_no, head, base):
+    """Shell steps to resolve a merge conflict locally (prx can't): gh stack
+    for a native stack, a plain rebase otherwise. `#` lines are comments."""
+    if stack_no:
+        return [f"gh stack checkout {stack_no}", "gh stack rebase",
+                "# fix the conflicts, then: gh stack rebase --continue", "gh stack push"]
+    return ["git fetch origin", f"git switch {head}", f"git rebase origin/{base}",
+            "# fix the conflicts, then: git rebase --continue", "git push --force-with-lease"]
+
+
+def live_chain(owner, name, number):
+    """walk_chain on GitHub: (numbers bottom to top, {number: fresh node}, err)."""
+    nodes = {}
+
+    def node_of(n):
+        if n not in nodes:
+            nd, err = fetch_pr_node(owner, name, n)
+            if err or not nd:
+                return None, err or f"#{n} not found"
+            nodes[n] = nd
+        return nodes[n], None
+
+    def parent_of(n):
+        nd, err = node_of(n)
+        if err:
+            return None, err
+        up = ((nd.get("baseRef") or {}).get("associatedPullRequests") or {}).get("nodes")
+        return (up[0]["number"] if up else None), None
+
+    def children_of(n):
+        nd, err = node_of(n)
+        return (None, err) if err else fetch_children(owner, name, nd["headRefName"])
+
+    chain, err = walk_chain(number, parent_of, children_of)
+    if not err:
+        for n in chain:  # children come as numbers only: fetch those nodes too
+            _, err = node_of(n)
+            if err:
+                break
+    return (None, None, err) if err else (chain, nodes, None)
+
+
+def mark_chains(rows):
+    """Give each row `kids` (open PRs based on its branch) and `tree` (it or a
+    sibling forks the chain, so no stack), then recompute its action, so the
+    bottom of a plain chain knows it is one. `m` is what M does on the row:
+    merge/land/stack/update from the action, else stack on any linkable row,
+    else update when its chain is behind. `drift` (a layer behind its parent,
+    or BEHIND) and `upd` (anything behind) cover the whole chain, and neither
+    is set while a layer conflicts: GitHub would refuse the update."""
+    kids = {}
+    for r in rows:
+        if r["status"] in ("open", "draft"):
+            kids.setdefault((r["repo"], r["base"]), []).append(r["number"])
+    for r in rows:
+        r["kids"] = kids.get((r["repo"], r["branch"]), [])
+        r["tree"] = len(r["kids"]) > 1 or bool(
+            r.get("parent_pr") and len(kids.get((r["repo"], r["base"]), [])) > 1)
+    # chain groups (plain or native, by base branch): drift anywhere marks all
+    live = [r for r in rows if r["status"] in ("open", "draft")]
+    by_head = {(r["repo"], r["branch"]): r for r in live}
+
+    def root(r):
+        seen = {id(r)}
+        while (p := by_head.get((r["repo"], r["base"]))) is not None and id(p) not in seen:
+            seen.add(id(p))
+            r = p
+        return r
+    groups = {}
+    for r in live:
+        groups.setdefault(id(root(r)), []).append(r)
+    for r in rows:
+        r["drift"] = r["upd"] = False
+    for g in groups.values():
+        if any(x["mergeable"] == "CONFLICTING" for x in g):
+            continue  # the update would be refused: offer it nowhere
+        # drift: behind its parent PR's branch, or BEHIND (the repo requires up to date)
+        drift = any(x["merge_state"] == "BEHIND" or (x.get("parent_pr") and (x.get("behind") or 0) > 0)
+                    for x in g)
+        behind = drift or any((x.get("behind") or 0) > 0 for x in g)
+        for x in g:
+            x["drift"], x["upd"] = drift, behind
+    for r in rows:
+        r["action"] = action_of(r)
+        r["m"] = (r["action"] if r["action"] in M_ACTIONS
+                  else "stack" if linkable(r) else "update" if r["upd"] else None)
+    return rows
+
+
+def row_hint(row, watched):
+    """(key, label) for the footer's right end: the most practical key for
+    the selected row. M when it acts, w while CI runs unwatched, else details."""
+    if row.get("m"):
+        return "M", row["m"]
+    if row["action"] == "wait" and not watched:
+        return "w", "watch"
+    return keycap("enter"), "details"
+
+
+def copy_text(text):
+    """Put text on the system clipboard. False when no clipboard tool exists."""
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        try:
+            if subprocess.run(cmd, input=text, text=True).returncode == 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def write_section(path, section, block):
+    """Rewrite one list section of the config file in place, keep the rest."""
+    lines = open(path).read().splitlines(True)
+    out, i, done = [], 0, False
+    while i < len(lines):
+        if not done and lines[i].split("#")[0].rstrip() == f"{section}:":
+            out += block
+            i += 1
+            while i < len(lines) and lines[i].startswith(" ") and lines[i].strip():
+                i += 1
+            done = True
+        else:
+            out.append(lines[i])
+            i += 1
+    if not done:
+        out += block
+    open(path, "w").write("".join(out))
+
+
+def write_repos(path, repos):
+    block = ["repos:\n"]
+    for r in repos:
+        block.append(f"  - name: {r['name']}\n")
+        block.append(f"    url: {r['url']}\n")
+        if r.get("icon"):
+            block.append(f"    icon: {r['icon']}\n")
+    write_section(path, "repos", block)
+
+
+def write_authors(path, authors):
+    block = ["authors:\n"]
+    for a in authors:
+        block.append(f"  - name: {a['name']}\n")
+        block.append(f"    tag: {a['tag']}\n")
+        if str(a.get("me")).lower() == "true":
+            block.append("    me: true\n")
+    write_section(path, "authors", block)
+
+
+def fetch_pr(repo, number):
+    return fetch_pr_node(*repo_slug(repo["url"]).split("/"), number)
+
+
+def fetch_pr_node(owner, name, number):
+    out = gh_read(["api", "graphql", "-f", f"query={PR_QUERY}", "-f", f"owner={owner}",
+                   "-f", f"name={name}", "-F", f"number={number}"])
+    if out.returncode != 0:
+        return None, gh_err(out)
+    return json.loads(out.stdout)["data"]["repository"]["pullRequest"], None
+
+
+def fetch_repo(repo):
+    owner, name = repo_slug(repo["url"]).split("/")
+    cutoff = iso_days_ago(max(WINDOW_DAYS.values()))
+    nodes = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        results = pool.map(lambda s: fetch_state(owner, name, s, cutoff),
+                           ("OPEN", "MERGED", "CLOSED"))
+    for ns, err in results:
+        if err:
+            return repo, None, err
+        nodes += ns
+    fetch_behind(owner, name, nodes)
+    return repo, nodes, None
+
+
+def classify(node):
+    """Map one GraphQL PR node to a display row dict."""
+    state = node["state"]
+    status = ("draft" if node["isDraft"] else state.lower()) if state == "OPEN" else state.lower()
+    decision = node.get("reviewDecision")
+    review = {"APPROVED": "reviewed", "CHANGES_REQUESTED": "changes"}.get(decision, "pending")
+    commits = node["commits"]["nodes"]
+    rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
+    ci, (passed, failed, running, queued, cancelled) = ci_of(rollup)
+    threads = node.get("reviewThreads") or {}
+    merge_state = node.get("mergeStateStatus")
+    repo = node.get("repository") or {}
+    parent = ((node.get("baseRef") or {}).get("associatedPullRequests") or {}).get("nodes")
+    reviewers = []
+    for rv in node.get("latestOpinionatedReviews", {}).get("nodes", []):
+        st = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes"}.get(rv["state"], "pending")
+        reviewers.append({"login": (rv.get("author") or {}).get("login", "?"), "state": st})
+    team_requests = 0
+    for rq in node.get("reviewRequests", {}).get("nodes", []):
+        who = rq.get("requestedReviewer") or {}
+        if who.get("login"):
+            reviewers.append({"login": who["login"], "state": "pending"})
+        else:  # a Team: naming it needs the read:org scope, so just count
+            team_requests += 1
+    if team_requests:
+        label = "team" if team_requests == 1 else f"team×{team_requests}"
+        reviewers.append({"login": label, "state": "pending", "team": True})
+    return {
+        "number": node["number"], "title": node["title"], "url": node["url"],
+        "login": (node.get("author") or {}).get("login", "?"),
+        "branch": node.get("headRefName", ""),
+        "base": node.get("baseRefName", ""),
+        "updated": node.get("updatedAt", ""),
+        "created": node.get("createdAt", ""),
+        "reviewers": reviewers,
+        "status": status, "review": review, "decision": decision,
+        "ci": ci, "mergeable": node.get("mergeable"), "merge_state": merge_state,
+        "checks": [passed, failed, running, queued, cancelled],
+        "rerun": rerun_ids(rollup) if ci == "CANCELLED" else {},
+        # review threads: [open, resolved, total]; open counts the first 100
+        "comments": [sum(not t["isResolved"] for t in threads.get("nodes", [])),
+                     threads.get("totalCount", 0) - sum(not t["isResolved"] for t in threads.get("nodes", [])),
+                     threads.get("totalCount", 0)],
+        "head_oid": node.get("headRefOid", ""),
+        "behind": node.get("_behind"),
+        "merge_queue": bool(node.get("isMergeQueueEnabled")),
+        "default_branch": (repo.get("defaultBranchRef") or {}).get("name"),
+        "method": repo.get("viewerDefaultMergeMethod") or "SQUASH",
+        "delete_branch": bool(repo.get("deleteBranchOnMerge")),
+        "parent_pr": parent[0]["number"] if parent else None,
+        "stack": stack_of(node),
+    }
+
+
+def newest_checks(rollup):
+    """The head commit's checks that count. Checks that ran again on the same
+    commit (a re-run, a label event, a run cancelled by a newer push of the
+    same workflow) count only with the newest: per Actions workflow, only its
+    newest run's checks (a run cancelled early can carry unexpanded matrix
+    names like `Tests (${{ matrix.x }})`, so names alone don't match); then
+    per check name, its newest start. That is what GitHub's PR page shows."""
+    nodes = ((rollup or {}).get("contexts") or {}).get("nodes", [])
+
+    def run_of(c):
+        r = (c.get("checkSuite") or {}).get("workflowRun") or {}
+        return (r.get("workflow") or {}).get("name", ""), r.get("runNumber")
+    latest = {}
+    for c in nodes:
+        wf, num = run_of(c)
+        if wf and num is not None:
+            latest[wf] = max(latest.get(wf, num), num)
+    newest, rest = {}, []
+    for c in nodes:
+        wf, num = run_of(c)
+        if wf and num is not None and num < latest[wf]:
+            continue  # an older run of this workflow: superseded
+        if c.get("__typename") == "CheckRun" and c.get("name"):
+            k = (wf, c["name"])
+            if k not in newest or (c.get("startedAt") or "") > (newest[k].get("startedAt") or ""):
+                newest[k] = c
+        else:
+            rest.append(c)
+    return rest + list(newest.values())
+
+
+def rerun_ids(rollup):
+    """{workflow run id: workflow name} for runs whose counting checks were
+    cancelled — what gh run rerun --failed restarts."""
+    out = {}
+    for c in newest_checks(rollup):
+        r = (c.get("checkSuite") or {}).get("workflowRun") or {}
+        if c.get("conclusion") == "CANCELLED" and r.get("databaseId"):
+            out[r["databaseId"]] = (r.get("workflow") or {}).get("name", "?")
+    return out
+
+
+def ci_of(rollup):
+    """(GREEN/YELLOW/RED/CANCELLED/-, [passed, failed, running, queued,
+    cancelled]) for one head commit, from newest_checks. A cancelled run is
+    no result, not a failure: CANCELLED (rerun) unless something failed or
+    still runs. GitHub's own rollup state counts stale and cancelled runs as
+    failures, so it is only the fallback when no contexts came back."""
+    nodes = ((rollup or {}).get("contexts") or {}).get("nodes", [])
+    passed = failed = running = queued = cancelled = 0
+    for c in newest_checks(rollup):
+        if c.get("__typename") == "CheckRun":
+            if c.get("status") == "COMPLETED":
+                if c.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+                    passed += 1
+                elif c.get("conclusion") == "CANCELLED":
+                    cancelled += 1
+                else:
+                    failed += 1
+            elif c.get("status") == "IN_PROGRESS":
+                running += 1
+            else:
+                queued += 1
+        else:
+            st = c.get("state")
+            passed += st == "SUCCESS"
+            failed += st in ("FAILURE", "ERROR")
+            queued += st not in ("SUCCESS", "FAILURE", "ERROR")
+    state = (rollup or {}).get("state")
+    if not nodes:
+        ci = {"SUCCESS": "GREEN", "FAILURE": "RED", "ERROR": "RED",
+              "PENDING": "YELLOW", "EXPECTED": "YELLOW"}.get(state, "-")
+    else:  # EXPECTED: a required status hasn't reported yet
+        ci = ("RED" if failed else "YELLOW" if running or queued or state == "EXPECTED"
+              else "CANCELLED" if cancelled else "GREEN" if passed else "-")
+    return ci, [passed, failed, running, queued, cancelled]
+
+
+def layer_ok(pr):
+    """One native-stack layer is ready to land: open, not draft, no conflict,
+    approved, CI green (or no checks). The bottom must also be CLEAN."""
+    commits = pr["commits"]["nodes"]
+    rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
+    approved = pr.get("reviewDecision") == "APPROVED" or (
+        pr.get("reviewDecision") is None and any(
+            rv["state"] == "APPROVED" for rv in pr["latestOpinionatedReviews"]["nodes"]))
+    return (pr["state"] == "OPEN" and not pr["isDraft"] and approved
+            and pr.get("mergeable") != "CONFLICTING"
+            and ci_of(rollup)[0] in ("GREEN", "-"))
+
+
+def stack_of(node):
+    """Native GitHub stack info, None when the PR isn't in one. `ready`: every
+    unmerged layer of the whole stack passes layer_ok, and the bottom one is
+    CLEAN — land merges them all in one go."""
+    st, entry = node.get("stack"), node.get("stackEntry")
+    if not st or not entry:
+        return None
+    layers = sorted((st.get("entries") or {}).get("nodes", []), key=lambda e: e["position"])
+    # positions stay put after merges: the bottom is the lowest unmerged layer
+    open_ = [e for e in layers if e["pullRequest"]["state"] != "MERGED"]
+    ready = (bool(open_) and open_[0]["pullRequest"]["mergeStateStatus"] == "CLEAN"
+             and all(layer_ok(e["pullRequest"]) for e in open_))
+    return {"number": st["number"], "size": st["size"], "position": entry["position"],
+            "ready": ready,
+            "layers": [{"number": e["pullRequest"]["number"],
+                        "login": (e["pullRequest"].get("author") or {}).get("login", "?")}
+                       for e in open_]}
+
+
+def action_of(row):
+    """The next move, first match wins. `review` is viewer-relative (me).
+    Draft outranks merge so an approved draft never says merge. Off the
+    default branch: land (native stack), hold (plain stack), blocked (other).
+    With gh-stack, hold and a plain chain's bottom merge become stack, but only
+    for squash/rebase: there a lone merge forces rebases above it."""
+    if row["status"] in ("merged", "closed"):
+        return "done"
+    if any(rv.get("me") and rv["state"] == "pending" for rv in row["reviewers"]):
+        return "review"
+    if row["mergeable"] == "CONFLICTING":
+        return "rebase"
+    if row["ci"] == "RED":
+        return "fix ci"
+    if row["ci"] == "CANCELLED":
+        return "rerun"  # CI never finished: nothing to fix, run it again
+    if row["review"] == "changes":
+        return "address"
+    if row["status"] == "draft":
+        return "ready"  # a draft's next move: mark it ready for review
+    if row.get("drift"):
+        return "update"  # its chain is behind what it lands on: update before landing
+    approved = row["review"] == "reviewed" or (row["decision"] is None and any(
+        rv["state"] == "approved" for rv in row["reviewers"]))
+    ready = approved and row["ci"] in ("GREEN", "-")
+    off_trunk = row.get("default_branch") and row["base"] != row["default_branch"]
+    link = linkable(row) and row["method"].upper() in ("SQUASH", "REBASE")
+    if ready and row.get("stack") and row["stack"]["ready"]:
+        return "land"  # native stack, every layer ready: any layer lands them all
+    if ready and off_trunk:
+        if row.get("stack"):
+            pass  # a layer of the stack isn't ready yet: no land
+        elif row["merge_state"] == "CLEAN":
+            if row.get("parent_pr"):
+                return "stack" if link else "hold"
+            return "blocked"
+    elif ready and row["merge_state"] == "CLEAN":
+        return "stack" if link and row.get("kids") else "merge"
+    if row["ci"] == "YELLOW":
+        return "wait"
+    return "chase"
+
+
+def fuzzy_score(q, row):
+    """Search PR number, branch, and title; 0 = no match, higher = better.
+    Digits bind to the ticket convention: '116' or 'ABC-116' (or 'abc116')
+    matches exactly the ABC-116 rows — never ABC-1160 or ABC-161 — or the PR
+    number. Short digit queries (under 3) match as prefixes so typing never
+    blanks the table. Anything else is a case-insensitive substring match."""
+    hay = f"#{row['number']} {row['branch']} {row['title']}".lower()
+    q = q.lower().strip()
+    if not q:
+        return 1
+    m = re.fullmatch(r"#?(\d+)", q)
+    if m:
+        d = m.group(1)
+        if str(row["number"]) == d:
+            return 4
+        if re.search(rf"[a-z]+-{d}(?!\d)", hay):
+            return 3
+        if len(d) < 3 and re.search(rf"[a-z]+-{d}\d*", hay):
+            return 2
+        if str(row["number"]).startswith(d):
+            return 2 if len(d) >= 3 else 1
+        return 0
+    m = re.fullmatch(r"([a-z]+)-?(\d+)", q)
+    if m:
+        prefix, d = m.groups()
+        if re.search(rf"\b{prefix}-?{d}(?!\d)", hay):
+            return 3
+        if len(d) < 3 and re.search(rf"\b{prefix}-?{d}\d*", hay):
+            return 2
+        return 0
+    return 1 if q in hay else 0
+
+
+def fuzzy_match(q, row):
+    return fuzzy_score(q, row) > 0
+
+
+def match_pattern(q):
+    """Regex highlighting what fuzzy_match matched, same length-adaptive rules."""
+    q = (q or "").lower().strip()
+    if not q:
+        return None
+    m = re.fullmatch(r"#?(\d+)", q)
+    if m:
+        d = m.group(1)
+        tail = r"(?!\d)" if len(d) >= 3 else r"\d*"
+        return re.compile(rf"[a-z]+-{d}{tail}|#{d}\d*", re.IGNORECASE)
+    m = re.fullmatch(r"([a-z]+)-?(\d+)", q)
+    if m:
+        prefix, d = m.groups()
+        tail = r"(?!\d)" if len(d) >= 3 else r"\d*"
+        return re.compile(rf"\b{prefix}-?{d}{tail}", re.IGNORECASE)
+    return re.compile(re.escape(q), re.IGNORECASE)
+
+
+def highlight_segs(segs, pat):
+    """Split segments so pattern matches render in the highlight color."""
+    out = []
+    for text, clr in segs:
+        last = 0
+        for m in pat.finditer(text):
+            if m.start() > last:
+                out.append((text[last:m.start()], clr))
+            out.append((m.group(0), "hl"))
+            last = m.end()
+        if last < len(text):
+            out.append((text[last:], clr))
+    return out
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "prx")
+CACHE_DAYS = 30  # = widest window; older nodes are pruned on save
+SYNC_MARGIN = 300  # s: watermark sits this far before the sync start (clock skew)
+
+
+def cache_path(slug):
+    return os.path.join(CACHE_DIR, hashlib.sha1(slug.encode()).hexdigest() + ".json")
+
+
+def load_cache(slug):
+    """Restore one repo's cache, or None when missing, broken, or written for
+    another query shape (fragment hash) — the caller then does a full sync."""
+    c = load_state(cache_path(slug))
+    if c.get("slug") != slug or c.get("fragment") != FRAGMENT_SHA:
+        return None
+    c.setdefault("states", {})
+    c.setdefault("nodes", {})
+    return c
+
+
+def save_cache(c):
+    """Prune nodes older than CACHE_DAYS, then write atomically (temp + rename)."""
+    cutoff = iso_days_ago(CACHE_DAYS)
+    c["nodes"] = {k: n for k, n in c["nodes"].items() if n.get("updatedAt", "") >= cutoff}
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = cache_path(c["slug"])
+        with open(path + ".tmp", "w") as f:
+            json.dump(c, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass  # the cache is disposable: next start just does a full sync
+
+
+def clear_cache():
+    for f in (os.listdir(CACHE_DIR) if os.path.isdir(CACHE_DIR) else []):
+        if f.endswith((".json", ".tmp")):
+            os.remove(os.path.join(CACHE_DIR, f))
+
+
+def write_config_key(path, key, value):
+    """Set one top-level key in the config file, preserving everything else."""
+    lines = open(path).read().splitlines(True)
+    out, done = [], False
+    for ln in lines:
+        bare = ln.split("#")[0]
+        if (not done and not ln.startswith((" ", "\t")) and ":" in bare
+                and bare.split(":")[0].strip() == key):
+            out.append(f"{key}: {value}\n")
+            done = True
+        else:
+            out.append(ln)
+    if not done:
+        out.insert(0, f"{key}: {value}\n")
+    open(path, "w").write("".join(out))
+
+
+def me_tag(cfg):
+    return next((a["tag"] for a in cfg["authors"]
+                 if str(a.get("me")).lower() == "true"), None)
+
+
+def build_rows(repo, nodes, authors, show_all, me=None):
+    rows = []
+    for node in nodes:
+        row = classify(node)
+        if not show_all and authors and row["login"] not in authors:
+            continue
+        row["repo"] = repo["name"]
+        row["org"] = repo_slug(repo["url"]).split("/")[0] if repo.get("url") else ""
+        icon = repo.get("icon", "")
+        row["repo_icon"] = REPO_ICONS.get(icon, icon or "")  # default: oct-repo
+        row["author"] = authors.get(row["login"], row["login"])
+        row["mine"] = me is not None and row["login"] == me
+        for rv in row["reviewers"]:
+            rv["name"] = authors.get(rv["login"], rv["login"])
+            rv["me"] = me is not None and rv["login"] == me
+            rv["known"] = rv["login"] in authors
+        row["ext_review"] = bool(authors) and any(
+            rv["state"] == "pending" and not rv["known"]
+            for rv in row["reviewers"])
+        row["action"] = action_of(row)
+        rows.append(row)
+    return rows
+
+
+def gather(cfg, show_all):
+    authors = {a["tag"]: a["name"] for a in cfg["authors"]}
+    me = me_tag(cfg)
+    rows, errors = [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for repo, nodes, err in pool.map(fetch_repo, cfg["repos"]):
+            if err:
+                errors.append(f"{repo['name']}: {err}")
+            else:
+                rows += build_rows(repo, nodes, authors, show_all, me)
+    return mark_chains(rows), errors
+
+
+# Named repo icons for the config's `icon:` key (Nerd Font glyphs).
+# Unknown values are used verbatim, so a raw glyph still works.
+REPO_ICONS = {
+    "angular": "󰚲", "react": "󰜈", "vue": "󰡄", "svelte": "",
+    "nextjs": "", "nuxt": "", "electron": "", "typescript": "󰛦",
+    "javascript": "󰌞", "nodejs": "󰎙", "nestjs": "", "deno": "",
+    "python": "󰌠", "java": "󰬷", "kotlin": "󱈙", "swift": "󰛥",
+    "go": "󰟓", "rust": "󱘗", "ruby": "󰴭", "rails": "",
+    "php": "󰌟", "laravel": "󰫐", "django": "", "flask": "",
+    "csharp": "󰌛", "dotnet": "󰪮", "cpp": "󰙲", "c": "󰙱",
+    "haskell": "󰲒", "scala": "", "elixir": "", "erlang": "",
+    "lua": "󰢱", "perl": "", "r": "󰟔", "dart": "",
+    "flutter": "", "bash": "󱆃", "html": "󰌝", "css": "󰌜",
+    "sass": "󰟬", "tailwind": "󱏿", "graphql": "󰡷", "docker": "󰡨",
+    "kubernetes": "󱃾", "terraform": "󱁢", "ansible": "󱂚", "jenkins": "",
+    "aws": "󰸏", "azure": "󰠅", "gcloud": "󱇶", "linux": "󰌽",
+    "apple": "󰀵", "windows": "󰖳", "android": "󰀲", "git": "󰊢",
+    "github": "󰊤", "gitlab": "󰮠", "bitbucket": "󰂨", "npm": "󰛷",
+    "postgres": "", "mysql": "", "mongodb": "", "redis": "",
+    "firebase": "󰥧", "kafka": "", "rabbitmq": "", "nginx": "",
+    "wordpress": "󰖴", "unity": "󰚯", "raspberrypi": "󰐿", "arduino": "",
+    "web": "󰖟", "monitor": "󰍹", "app": "󰲋", "mobile": "󰄡",
+    "server": "󰒋", "database": "󰆼", "api": "󱂛", "cog": "󰒓",
+    "chip": "󰘚", "lambda": "󰘧", "cloud": "󰅟", "robot": "󰚩",
+    "repo": "󰳏", "book": "󰂺", "package": "󰏗",
+}
+
+# GitHub primaryLanguage -> icon name, for prefilling the repo sync modal
+LANG_ICON = {"TypeScript": "typescript", "JavaScript": "javascript", "Python": "python",
+             "Go": "go", "Rust": "rust", "Java": "java", "Kotlin": "kotlin",
+             "Swift": "swift", "Ruby": "ruby", "PHP": "php", "C#": "csharp",
+             "C++": "cpp", "C": "c", "HTML": "html", "CSS": "css", "Shell": "bash",
+             "Dart": "dart", "Scala": "scala", "Elixir": "elixir", "Haskell": "haskell",
+             "Lua": "lua", "Perl": "perl", "R": "r", "Vue": "vue", "Svelte": "svelte",
+             "Dockerfile": "docker", "HCL": "terraform"}
+
+NF = True  # nerd font present; set from config at TUI start
+
+# ── Single source of truth for every glyph the TUI prints ──────────
+# name -> (nerd glyph, plain fallback). Resolve with icon(); a "" fallback
+# means the glyph is decorative and simply vanishes without a nerd font.
+ICON = {
+    # PR status (leading column)
+    "open": ("", "○"), "draft": ("", "·"),
+    "merged": ("", "●"), "closed": ("", "×"),
+    # CI rollup, loudest state
+    "ci_pass": ("󰗡", "✓"), "ci_fail": ("󰅙", "✗"), "ci_cancel": ("󰜺", "⊘"),
+    "ci_run": ("󰐾", "~"), "ci_queue": ("󰝦", "?"),
+    "ci_none": ("-", "-"),
+    # row actions (the word is always printed; the icon is optional)
+    "review": ("󰈈", ""), "merge": ("󰘭", ""),
+    "rebase": ("󱓍", ""), "fix ci": ("󰖷", ""),
+    "address": ("󱆿", ""), "ready": ("󰏫", ""),
+    "wait": ("󰦖", ""), "chase": ("󰃦", ""),
+    "done": ("󰄬", ""), "land": ("󰌨", ""),
+    "hold": ("󰏤", ""), "blocked": ("󰜹", ""),
+    "stack": ("󰌷", ""), "update": ("󰚰", ""), "rerun": ("󰑐", ""),
+    # filter labels (leading slot; without a nerd font the trigger key shows)
+    "f_org": ("󰇗", ""), "f_state": ("󱖫", ""),
+    "f_repo": ("󰊢", ""), "f_author": ("󰀄", ""),
+    "f_last": ("󰋚", ""), "f_sort": ("󰒺", ""),
+    # footer / command actions
+    "quit": ("󰩈", "qq"), "settings": ("", ","), "help": ("?", "?"),
+    # misc decorations
+    "approve": ("󰔓", "+"), "team": ("󰡉", "&"),
+    "rev_changes": ("󰔑", "-"), "rev_requested": ("󰈈", "?"), "rev_pending": ("󰭖", "?"),
+    "branch": ("", ""), "org": ("󰇗", ""),
+    "pr": ("󰓂", "PR"),
+}
+
+
+def icon(name, nf=None):
+    """Resolve a glyph name to its nerd glyph or plain fallback."""
+    nf = NF if nf is None else nf
+    g = ICON[name]
+    return g[0] if nf else g[1]
+
+
+# Keypress tokens. name -> (nerd/unicode symbol, ascii). Anything not listed
+# (letters, "qq", "/", "?") resolves to itself.
+KEYCAP = {
+    "esc": ("␛", "␛"), "enter": ("↵", "↵"), "tab": ("⇥", "tab"),
+    "space": ("␣", "␣"),
+    "shift": ("⇧", "shift"), "ctrl": ("⌃", "ctrl"),
+    "up_down": ("↑↓", "↑↓"), "right": ("→", "→"), "left": ("←", "←"),
+}
+
+
+def keycap(name, nf=None):
+    """Resolve one key to its display token."""
+    nf = NF if nf is None else nf
+    p = KEYCAP.get(name)
+    return (p[0] if nf else p[1]) if p else name
+
+
+# which trigger key cycles each filter: always its label's first letter
+FILTER_KEY = {"org": "o", "state": "s", "repo": "r",
+              "author": "a", "last": "l", "sort": "b"}
+# label shown in the bar; the internal name stays (state.json keys, ICON names)
+FILTER_LABEL = {"sort": "by"}
+STATUS_COLOR = {"open": "green", "draft": "grey",
+                "merged": "purple", "closed": "red"}
+CI_CLR = {"GREEN": "green", "YELLOW": "yellow", "RED": "red", "CANCELLED": "grey", "-": "grey"}
+ACTION_COLOR = {"review": "me", "merge": "green", "rebase": "orange",
+                "fix ci": "red", "address": "red", "ready": "grey",
+                "wait": "yellow", "chase": "white", "done": "darkgrey",
+                "land": "green", "hold": "purple", "blocked": "orange",
+                "stack": "green", "update": "green", "rerun": "green"}
+ACTION_WHY = {
+    "review": "your review is requested",
+    "merge": "approved and green — merge it",
+    "rebase": "merge conflict — rebase onto the base branch",
+    "fix ci": "a required check failed",
+    "address": "changes were requested",
+    "ready": "still a draft — mark it ready for review",
+    "wait": "CI is running — nothing to do yet",
+    "chase": "reviews are missing — go ping",
+    "done": "merged or closed",
+    "land": "native stack, all layers ready — M merges the whole stack in one go",
+    "hold": "stacked on another open PR — merge that one first (gh-stack would link them)",
+    "stack": "plain stack — M links the whole chain into a native stack (gh stack link)",
+    "update": "behind what it lands on — M updates the chain bottom-up first",
+    "rerun": "CI was cancelled, nothing failed — M re-runs the cancelled jobs",
+    "blocked": "base isn't the default branch — merge in the browser",
+}
+DECISION_LABEL = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes requested",
+                  "REVIEW_REQUIRED": "review required"}
+
+# ── Semantic color roles (chrome) → base palette name ──────────────────
+# Data-state colors stay in STATUS_COLOR / CI_CLR / ACTION_COLOR. Change a
+# role here to restyle every label/value/divider/accent at once; make_palette
+# aliases each role into pal, so pal["label"] resolves like any color name.
+ROLE = {
+    "label": "grey",       # secondary text: filter/hint/column labels
+    "value": "white",      # primary values
+    "muted": "darkgrey",   # dividers, de-emphasized text
+    "accent": "cyan",      # repo, section headers, PR count
+    "border": "grey",      # modal/box borders
+}
+
+
+STATE_FILTERS = ("all", "open", "merged", "closed")
+STATES_FOR = {"all": ("OPEN", "MERGED", "CLOSED"), "open": ("OPEN",),
+              "merged": ("MERGED",), "closed": ("CLOSED",)}
+STATUS_GROUP = {"open": "OPEN", "draft": "OPEN", "merged": "MERGED", "closed": "CLOSED"}
+
+
+def filter_rows(rows, state_f, window):
+    cutoff = iso_days_ago(WINDOW_DAYS[window])
+    rows = [r for r in rows if r["updated"] >= cutoff]
+    if state_f == "open":
+        return [r for r in rows if r["status"] in ("open", "draft")]
+    if state_f in ("merged", "closed"):
+        return [r for r in rows if r["status"] == state_f]
+    return rows
+
+REVW = 9  # TUI REV: verdict(2) pending(2) me(3) + 2 spaces, always this wide
+PLAIN_REVW = 10  # --plain REV lists names, so it keeps its own width
+HEADER = f"   {'REPO':<5}  {'PR':<7}{'CI':<3}{'AUTHOR':<8}{'REV':<{REVW}}{'DAYS':>4} {'CHNG':>4} {'BRANCH':<18}TITLE"
+HEADER_C = f"     {'PR':<7}{'CI':<3}{'BRANCH':<18}TITLE"  # compact mode
+COMPACT_BELOW = 95  # auto-switch to compact under this terminal width
+ACTW = 11  # action column, right-aligned at the window edge
+
+
+def ci_icon(row):
+    """One icon for the loudest check state: 󰅙 red any failed, 󰐾 yellow any
+    running, 󰝦 grey queued, 󰜺 grey cancelled (no result), 󰗡 green all
+    passed, - when no checks."""
+    passed, failed, running, queued, cancelled = row["checks"]
+    if not passed + failed + running + queued + cancelled:
+        return icon("ci_none"), "grey"
+    if failed:
+        return icon("ci_fail"), "red"
+    if running:
+        return icon("ci_run"), "yellow"
+    if queued:
+        return icon("ci_queue"), "grey"
+    if cancelled:
+        return icon("ci_cancel"), "grey"
+    return icon("ci_pass"), "green"
+
+
+def reviewer_segments(row):
+    """Three fixed slots, blank-padded to REVW so they line up in every row:
+    verdict — 󰔑N change-requesters (red) if any, else 󰔓N approvals (green),
+    󰔓0 dark grey when neither; pending — 󰭖N open requests, people plus
+    teams (grey, orange if any is a team or an outsider; 󰭖0 dark grey); then
+    me with my state: 󰈈me requested (blue), 󰔑me changes (red), 󰔓me approved
+    (green). ASCII: +N -N ?N, ?me -me +me."""
+    others = [rv for rv in row["reviewers"] if not rv.get("me")]
+    approved = [rv for rv in row["reviewers"] if rv["state"] == "approved"]
+    changes = [rv for rv in others if rv["state"] == "changes"]
+    people = [rv for rv in others if rv["state"] == "pending" and not rv.get("team")]
+    teams = sum(int(rv["name"].partition("×")[2] or 1)  # label "team" or "team×N"
+                for rv in row["reviewers"] if rv.get("team"))
+    mine = next((rv for rv in row["reviewers"] if rv.get("me")), None)
+
+    def slot(glyph, n, c):  # ponytail: counts cap at 9 to keep slots 2 wide
+        return (f"{icon(glyph)}{min(n, 9)}", c if n else "darkgrey")
+
+    if changes:
+        verdict = slot("rev_changes", len(changes), "red")
+    else:
+        verdict = slot("approve", len(approved), "green")
+    odd = teams or not all(rv.get("known", True) for rv in people)
+    segs = [verdict, (" ", "label"),
+            slot("rev_pending", len(people) + teams, "orange" if odd else "grey")]
+    if mine:
+        glyph, c = {"pending": ("rev_requested", "mine"), "changes": ("rev_changes", "red"),
+                    "approved": ("approve", "green")}[mine["state"]]
+        segs += [(" ", "label"), (f"{icon(glyph)}me", c)]
+    used = sum(len(t) for t, _ in segs)
+    return segs + [(" " * (REVW - used), "label")]
+
+
+def row_segments(row, compact=False):
+    st = row["status"]
+    ic, iclr = icon(st), STATUS_COLOR.get(st, "white")
+    ci, ci_clr = ci_icon(row)
+    br = f"{icon('branch')} " if NF else ""
+    rep = f"{row['repo_icon']} " if NF else ""
+    if compact:
+        return [
+            (f"{ic}  ", iclr),
+            (f"#{row['number']:<6}", "value"),
+            (f"{ci}  ", ci_clr),
+            (f"{br}{row['branch']:<15.15} ", "label"),
+            (row["title"], "value"),
+        ]
+    return [
+        (f"{ic}  ", iclr),
+        (f"{rep}{row['repo']:<2.2} ", "accent"),
+        (f"#{row['number']:<6}", "value"),
+        (f"{ci}  ", ci_clr),
+        (f"{row['author']:<7.7} ", "blue" if row.get("mine") else "value"),
+        *reviewer_segments(row),
+        (f"{age_str(row['created']):>4} ", "label"),
+        (f"{age_str(row['updated']):>4} ", "label"),
+        (f"{br}{row['branch']:<15.15} ", "label"),
+        (row["title"], "value"),
+    ]
+
+
+def action_segment(row):
+    act = row["action"]
+    clr = ACTION_COLOR[act]
+    txt = f"{icon(act)} {act:<8}" if NF else f"{act:<10}"
+    return txt, clr
+
+
+PLAIN_HEADER = (f"{'REPO':<9}{'PR':<7}{'AUTHOR':<8}{'STATUS':<8}{'REVIEW':<9}"
+                f"{'CI':<8}{'ACTION':<9}{'REV':<{PLAIN_REVW}}{'DAYS':>4} {'CHNG':>4} {'BRANCH':<24}TITLE")
+
+
+def format_row(row):
+    marks = {"approved": "+", "changes": "-", "pending": "?"}
+    reviewers = " ".join(f"{'me' if r.get('me') else r['name']:.7}{marks[r['state']]}"
+                         for r in sorted(row["reviewers"], key=lambda r: not r.get("me"))) or "-"
+    return (f"{row['repo']:<8.8} #{row['number']:<6}{row['author']:<10.10} "
+            f"{row['status']:<8}{row['review']:<9}{row['ci']:<8}{row['action']:<9}"
+            f"{reviewers:<{PLAIN_REVW - 1}.{PLAIN_REVW - 2}}{age_str(row['created']):>4} "
+            f"{age_str(row['updated']):>4} {row['branch']:<23.22} {row['title']}")
+
+
+def scroll_window(n, body, top, sel):
+    """Scroll so line `sel` stays visible when the first/last visible line
+    turns into a "more" marker. Returns (top, marker up, marker down)."""
+    if body < 3:  # too short for markers: plain scrolling
+        top = min(max(top, sel - body + 1), sel)
+        return max(0, top), False, False
+    top = max(0, min(top, sel))
+    while True:
+        up, down = top > 0, top + body < n
+        if sel < top + up:
+            top -= 1
+        elif sel > top + body - 1 - down:
+            top += 1
+        else:
+            return top, up, down
+
+
+def sort_rows(rows, by):
+    rows = sorted(rows, key=lambda r: r["updated"], reverse=True)  # newest first
+    return sorted(rows, key=lambda r: (r[by], r["repo"]))  # stable: keeps recency order
+
+
+def stack_order(rows):
+    """Group stacked PRs (base branch = another visible row's head branch) under
+    their parent. Returns (ordered rows, marker per row index): parent "▪",
+    descendants "├", last one "└" — a flat rail regardless of depth."""
+    by_head = {(r["repo"], r["branch"]): r for r in rows}
+    children, roots = {}, []
+    for r in rows:
+        parent = by_head.get((r["repo"], r["base"]))
+        if parent is not None and parent is not r:
+            children.setdefault(id(parent), []).append(r)
+        else:
+            roots.append(r)
+    ordered, markers, seen = [], [], set()
+
+    def emit(r):
+        if id(r) in seen:  # cycle guard
+            return 0
+        seen.add(id(r))
+        ordered.append(r)
+        markers.append("")
+        n = 1
+        for c in children.get(id(r), []):
+            n += emit(c)
+        return n
+
+    for root in roots:
+        if id(root) in seen:
+            continue
+        start = len(ordered)
+        n = emit(root)
+        if n > 1:
+            markers[start] = "▪"
+            for i in range(start + 1, start + n):
+                markers[i] = "├"
+            markers[start + n - 1] = "└"
+    return ordered, markers
+
+
+PLAIN_RAIL = {"▪": "▫", "├": "┆", "└": "╰"}
+
+
+def rail_mark(mark, row):
+    """Stack rail glyph and color: native stacks solid purple, plain chains
+    (linkable with gh stack link) dashed grey."""
+    return (mark, "purple") if row.get("stack") else (PLAIN_RAIL.get(mark, mark), "grey")
+
+
+def print_plain(rows, errors, by):
+    print(PLAIN_HEADER)
+    if by == "stack":
+        rows, _ = stack_order(sort_rows(rows, "repo"))
+    else:
+        rows = sort_rows(rows, by)
+    for row in rows:
+        print(format_row(row))
+    for err in errors:
+        print(f"error: {err}", file=sys.stderr)
+
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+PEEK_HOLD = 0.5  # 'h' hold-for-hints revert delay; > OS key-repeat interval
+HELP_FLASH = 0.6  # help modal: how long a matched key's row stays highlighted
+
+
+def make_palette():
+    curses.use_default_colors()
+    has256 = curses.COLORS >= 256
+    defs = {"green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW,
+            "red": curses.COLOR_RED, "cyan": curses.COLOR_CYAN,
+            "grey": 245 if has256 else curses.COLOR_WHITE,
+            "darkgrey": 238 if has256 else curses.COLOR_WHITE,
+            "purple": 135 if has256 else curses.COLOR_MAGENTA,
+            "orange": 208 if has256 else curses.COLOR_YELLOW,
+            "blue": 33 if has256 else curses.COLOR_BLUE,
+            "white": 231 if has256 else curses.COLOR_WHITE}
+    pal = {}
+    for i, (name, fg) in enumerate(defs.items(), 1):
+        curses.init_pair(i, fg, -1)
+        pal[name] = curses.color_pair(i)
+    if not has256:
+        pal["grey"] |= curses.A_DIM
+        pal["darkgrey"] |= curses.A_DIM
+    # the one pair with a real background: black on grey, for the help flash.
+    # 16 is true black; color 0 follows the terminal theme and is often not.
+    curses.init_pair(len(defs) + 1, 16 if has256 else curses.COLOR_BLACK,
+                     245 if has256 else curses.COLOR_WHITE)
+    pal["flash"] = curses.color_pair(len(defs) + 1)
+    pal["dim"] = pal["grey"]
+    pal["me"] = pal["orange"] | curses.A_BOLD | curses.A_REVERSE  # review action
+    pal["mine"] = pal["blue"] | curses.A_BOLD | curses.A_REVERSE  # me in REV
+    pal["hl"] = pal["yellow"] | curses.A_BOLD | curses.A_REVERSE
+    for role, base in ROLE.items():  # semantic roles alias to base colors
+        pal[role] = pal[base]
+    pal["cur"] = pal["value"] | curses.A_BOLD  # current item, bold/bright
+    return pal
+
+
+def safe_add(stdscr, y, x, text, attr):
+    height, width = stdscr.getmaxyx()
+    if y >= height or x >= width:
+        return
+    try:
+        stdscr.addstr(y, x, text[:width - x], attr)
+    except curses.error:
+        pass  # writing the bottom-right cell always raises after painting
+
+
+def draw_tag(stdscr, pal, y, x, parts):
+    """Label laid over a border line, no caps — the ─ runs separate tags."""
+    cx = x
+    for text, attr in parts:
+        safe_add(stdscr, y, cx, text, attr)
+        cx += len(text)
+    return cx + 1
+
+
+def ask_nerd_font(stdscr, pal):
+    """First-run prompt: show sample glyphs, let the user confirm they render.
+    Returns True (nerd font) / False (ASCII fallbacks)."""
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+    mw = max(46, min(64, w - 4))
+    y0, x0 = h // 2 - 3, (w - mw) // 2
+    lines = [
+        "Do these show as icons (not boxes or ??)?",
+        "",
+        "   󰗡  󰅙  󰊢  󰀄  󰇗  󰓂  󰏫  ",
+        "",
+        "y = yes, use icons     n = no, use plain text",
+    ]
+    safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+    for i, t in enumerate(lines):
+        safe_add(stdscr, y0 + 1 + i, x0, "│", pal["grey"])
+        safe_add(stdscr, y0 + 1 + i, x0 + mw - 1, "│", pal["grey"])
+        clr = pal["white"] | curses.A_BOLD if i in (0, 2) else pal["grey"]
+        safe_add(stdscr, y0 + 1 + i, x0 + 1, t.center(mw - 2)[:mw - 2], clr)
+    safe_add(stdscr, y0 + 1 + len(lines), x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+    stdscr.refresh()
+    while True:
+        k = stdscr.getch()
+        if k in (ord("n"), ord("N")):
+            return False
+        if k in (ord("y"), ord("Y"), curses.KEY_ENTER, 10, 13):
+            return True
+
+
+def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
+    curses.curs_set(0)
+    # pop any leftover kitty keyboard-protocol flags (a prior crash could
+    # strand them, garbling input); no-op on an empty stack or other terminals
+    sys.stdout.write("\x1b[<u")
+    sys.stdout.flush()
+    stdscr.timeout(100)
+    pal = make_palette()
+    global NF
+    if "nerd_font" in cfg:
+        NF = str(cfg.get("nerd_font", "true")).lower() != "false"
+    else:  # first run: ask, since font presence can't be probed reliably
+        NF = ask_nerd_font(stdscr, pal)
+        try:
+            write_config_key(cfg_path, "nerd_font", "true" if NF else "false")
+        except OSError:
+            pass
+    by, cursor, top, spin, state_f, window = "stack", 0, 0, 0, "all", "week"
+    compact = False  # 'c' toggles; narrow terminals force it
+    authors = {a["tag"]: a["name"] for a in cfg["authors"]}
+    me = me_tag(cfg)
+    author_cycle = [None] + [a["name"] for a in cfg["authors"]]
+    author_f = None
+    repo_f = None
+
+    def repos_of(org):
+        """Repo filter cycle: all repos, or only the org's when one is set."""
+        return [None] + [r["name"] for r in cfg["repos"]
+                         if not org or repo_slug(r["url"]).split("/")[0] == org]
+    org_list = sorted({repo_slug(r["url"]).split("/")[0] for r in cfg["repos"]})
+    org_f = None
+    waiting = set()  # (repo short name, PR number) on the fast refresh schedule
+    auto_on = refresh_s > 0
+    last_q = 0.0
+
+    # hydrate last session's filters/waiting (config: restore_filters/restore_waiting)
+    state_path = os.path.join(os.path.dirname(cfg_path) or ".", "state.json")
+    saved = load_state(state_path)
+    if str(cfg.get("restore_filters", "true")).lower() != "false":
+        window = saved.get("window") if saved.get("window") in WINDOWS else window
+        by = saved.get("by") if saved.get("by") in ("stack", "repo", "author") else by
+        state_f = saved.get("state") if saved.get("state") in STATE_FILTERS else state_f
+        org_f = saved.get("org") if saved.get("org") in org_list else None
+        repo_f = saved.get("repo") if saved.get("repo") in repos_of(org_f) else None
+        author_f = saved.get("author") if saved.get("author") in author_cycle else None
+        auto_on = bool(saved.get("auto_on", auto_on))
+        compact = bool(saved.get("compact", False))
+    if str(cfg.get("restore_waiting", "true")).lower() != "false":
+        names = {r["name"] for r in cfg["repos"]}
+        waiting = {(rn, n) for rn, n in map(tuple, saved.get("waiting", []))
+                   if rn in names}
+    last_snap = None
+    show_keys = str(cfg.get("show_filter_keys", "false")).lower() == "true"
+    peek_until = 0.0  # 'h' held: show trigger keys until repeats stop (~PEEK_HOLD)
+    search_q, search_edit = None, False  # "/" fuzzy search over visible rows
+    snap_best = False  # jump selection to the best match after a search edit
+    state = {"rows": [], "errors": [], "at": None,
+             "pending": set(), "started": 0.0,
+             "pending_prs": set(), "w_started": 0.0,
+             "cover": {"days": 0, "states": set(), "repos": set()}}
+    lock = threading.Lock()
+    reload_due = None
+    caches = {}  # repo name -> cache dict (see load_cache); only the TUI uses it
+    cache_lock = threading.Lock()  # own lock: callers may already hold `lock`
+
+    def cache_of(repo):
+        """The repo's cache, loaded on first use, so repos added in the
+        settings modal (or renamed onto another slug) get one too."""
+        slug = repo_slug(repo["url"])
+        with cache_lock:
+            c = caches.get(repo["name"])
+            if c is None or c["slug"] != slug:
+                c = caches[repo["name"]] = load_cache(slug) or {
+                    "slug": slug, "fragment": FRAGMENT_SHA, "states": {}, "nodes": {}}
+            return c
+
+    def restore():
+        """Show last session's rows at once; the start-up sync then updates them."""
+        rows, newest = [], 0
+        for repo in cfg["repos"]:
+            c = cache_of(repo)
+            rows += build_rows(repo, list(c["nodes"].values()), authors, show_all, me)
+            newest = max([newest] + [w.get("at", 0) for w in c["states"].values()])
+        state["rows"] = rows
+        state["restored"] = newest
+    restore()
+    widen = True  # scope grew (or first load): show a loading line under the rows
+    toast = {"text": "", "until": 0.0}  # short footer note, e.g. after a yank
+
+    def yank(row, what):
+        """y copies the PR number, Y the link; the footer confirms."""
+        text = f"#{row['number']}" if what == "number" else row["url"]
+        ok = copy_text(text)
+        toast.update(text=f"copied {text}" if ok else "no clipboard tool found",
+                     until=time.time() + 1.5)
+
+    def scope():
+        """What the current filters need fetched."""
+        days = WINDOW_DAYS[window]
+        states = STATES_FOR[state_f]
+        repos = [r for r in cfg["repos"]
+                 if (not repo_f or r["name"] == repo_f)
+                 and (not org_f or repo_slug(r["url"]).split("/")[0] == org_f)]
+        return days, states, repos
+
+    def coverage_missing():
+        days, states, repos = scope()
+        c = state["cover"]
+        return (days > c["days"] or not set(states) <= c["states"]
+                or not {r["name"] for r in repos} <= c["repos"])
+
+    def start_fetch():
+        if state["pending"]:
+            return
+        days, states, repos = scope()
+        state["cover"] = {"days": days, "states": set(states),
+                          "repos": {r["name"] for r in repos}}
+        state["started"] = time.time()
+        state["pending"] = {(r["name"], s) for r in repos for s in states}
+        state["errors"] = []
+        seen = {r["name"]: set() for r in repos}  # PR numbers fetched this round
+        failed = set()
+        synced_at = iso_days_ago(SYNC_MARGIN / 86400)  # the next watermark
+
+        def work(repo, st):
+            owner, name = repo_slug(repo["url"]).split("/")
+            cutoff, after, err = iso_days_ago(days), None, None
+            c = cache_of(repo)
+            mark = c["states"].get(st)
+            # delta sync: merged PRs are final, so MERGED stops at the watermark,
+            # but only inside the range a previous sync covered; else full sync
+            delta = st == "MERGED" and mark and mark["covered_since"] <= cutoff
+            stop_at = max(mark["watermark"], cutoff) if delta else cutoff
+            got = set()
+            try:
+                for _ in range(MAX_PAGES):
+                    nodes, after, err = fetch_page(owner, name, st, after)
+                    if err:
+                        break
+                    carry_behind(c["nodes"], nodes)
+                    new = build_rows(repo, nodes, authors, show_all, me)
+                    with lock:  # upsert this page's rows immediately
+                        got.update(n["number"] for n in nodes)
+                        c["nodes"].update((str(n["number"]), n) for n in nodes)
+                        nums = {r["number"] for r in new}
+                        state["rows"] = [r for r in state["rows"]
+                                         if r["repo"] != repo["name"] or r["number"] not in nums] + new
+                    if not after or (nodes and nodes[-1]["updatedAt"] < stop_at):
+                        break
+                if st == "OPEN" and not err:  # behind counts for every open PR
+                    opens = [n for n in c["nodes"].values() if n["number"] in got]
+                    fetch_behind(owner, name, opens)
+                    new = build_rows(repo, opens, authors, show_all, me)
+                    with lock:
+                        nums = {r["number"] for r in new}
+                        state["rows"] = [r for r in state["rows"]
+                                         if r["repo"] != repo["name"] or r["number"] not in nums] + new
+            except Exception as e:
+                err = str(e)
+            with lock:
+                if delta:  # unchanged merged PRs came from the cache: still valid
+                    got.update(n["number"] for n in c["nodes"].values()
+                               if n["state"] == st and n["updatedAt"] >= cutoff)
+                elif not err:  # full sync: cached PRs of this state it didn't return are gone
+                    c["nodes"] = {k: n for k, n in c["nodes"].items()
+                                  if n["state"] != st or n["updatedAt"] < cutoff
+                                  or n["number"] in got}
+                seen[repo["name"]].update(got)
+                if not err:  # a failed sync advances neither timestamp
+                    c["states"][st] = {"watermark": synced_at, "covered_since":
+                                       mark["covered_since"] if delta else cutoff,
+                                       "at": time.time()}  # real time, for "restored … ago"
+                if err:
+                    state["errors"].append(f"{repo['name']}: {err}")
+                    failed.add(repo["name"])
+                state["pending"].discard((repo["name"], st))
+                repo_done = not any(rn == repo["name"] for rn, _ in state["pending"])
+                if repo_done:
+                    save_cache(c)
+                if repo_done and repo["name"] not in failed:
+                    # drop rows that vanished from GitHub this round (fetched states only)
+                    state["rows"] = [r for r in state["rows"] if r["repo"] != repo["name"]
+                                     or STATUS_GROUP[r["status"]] not in states
+                                     or r["number"] in seen[repo["name"]]]
+                if not state["pending"]:
+                    state["at"] = time.time()
+        for repo in repos:
+            for st in states:
+                threading.Thread(target=work, args=(repo, st), daemon=True).start()
+
+    def modal_msg(text, wait_key=False):
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        mpad = 0 if (compact or width < COMPACT_BELOW) else 1
+        mw = max(40, min(70, width - 4))
+        mh = 3 + 2 * mpad
+        y0, x0 = height // 2 - mh // 2, (width - mw) // 2
+        safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+        for r in range(y0 + 1, y0 + mh - 1):
+            safe_add(stdscr, r, x0, "│", pal["grey"])
+            safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+        safe_add(stdscr, y0 + 1 + mpad, x0 + 1, text.center(mw - 2)[:mw - 2], pal["white"])
+        safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+        stdscr.refresh()
+        while wait_key and stdscr.getch() == -1:  # getch times out (100 ms) in the TUI
+            pass
+
+    def modal_list(title, items, checked=None):
+        """Modal list. Single-select returns an index, checkbox mode (checked is
+        a set) returns the set on enter; None on esc/cancel."""
+        cur, mtop = 0, 0
+        while True:
+            height, width = stdscr.getmaxyx()
+            mpad = 0 if (compact or width < COMPACT_BELOW) else 1
+            mw = max(44, min(74, width - 4))
+            mh = max(4, min(len(items) + 2 + 2 * mpad, height - 2))
+            body = mh - 2 - 2 * mpad
+            y0, x0 = (height - mh) // 2, (width - mw) // 2
+            mtop = max(0, min(mtop, cur))
+            if cur >= mtop + body:
+                mtop = cur - body + 1
+            stdscr.erase()
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            draw_tag(stdscr, pal, y0, x0 + 2,
+                     [(f" {title} ", pal["white"] | curses.A_BOLD)])
+            for r in range(y0 + 1, y0 + mh - 1):
+                safe_add(stdscr, r, x0, "│", pal["grey"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+            for i in range(body):
+                idx, yy = mtop + i, y0 + 1 + mpad + i
+                if idx >= len(items):
+                    continue
+                mark = "" if checked is None else \
+                    ("[x] " if items[idx] in checked else "[ ] ")
+                attr = curses.A_REVERSE if idx == cur else 0
+                safe_add(stdscr, yy, x0 + 1,
+                         f" {mark}{items[idx]}".ljust(mw - 2)[:mw - 2],
+                         pal["white"] | attr)
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            hints = ([(keycap("space"), "toggle")] if checked is not None else []) + \
+                [(keycap("enter"), "ok"), (keycap("esc"), "cancel")]
+            hx = x0 + 2
+            for kh, lb in hints:
+                hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
+                              [(f" {kh} ", pal["white"] | curses.A_BOLD),
+                               (f"{lb} ", pal["grey"])])
+            stdscr.refresh()
+            k = stdscr.getch()
+            if k in (27, curses.KEY_LEFT):
+                return None
+            if k in (curses.KEY_DOWN, ord("j")):
+                cur = min(cur + 1, max(0, len(items) - 1))
+            elif k in (curses.KEY_UP, ord("k")):
+                cur = max(0, cur - 1)
+            elif k == ord(" ") and checked is not None and items:
+                checked.symmetric_difference_update({items[cur]})
+            elif k in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT) and items:
+                return checked if checked is not None else cur
+
+    def modal_repos(org, names, checked, meta):
+        """Checkbox repo list. Right arrow drills into the row's cells
+        (name, then icon), left arrow backs out (past the row = back to orgs)."""
+        cur, mtop, level, filt = 0, 0, "row", ""
+        icon_names = [""] + list(REPO_ICONS)
+        hints = {
+            "row": ((keycap("space"), "select"), (keycap("right"), "edit"),
+                    (keycap("enter"), "ok"), (keycap("esc"), "cancel")),
+            "name": (("type", "2 chars"), (keycap("right"), "icon"),
+                     (keycap("left"), "back")),
+            "icon": ((keycap("up_down"), "choose"), ("type", "filter"),
+                     (keycap("left"), "back")),
+        }
+        while True:
+            height, width = stdscr.getmaxyx()
+            mpad = 0 if (compact or width < COMPACT_BELOW) else 1
+            mw = max(56, min(78, width - 4))
+            mh = max(4, min(len(names) + 2 + 2 * mpad, height - 2))
+            body = mh - 2 - 2 * mpad
+            y0, x0 = (height - mh) // 2, (width - mw) // 2
+            mtop = max(0, min(mtop, cur))
+            if cur >= mtop + body:
+                mtop = cur - body + 1
+            stdscr.erase()
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            draw_tag(stdscr, pal, y0, x0 + 2,
+                     [(f" repos in {icon('org')} {org} " if NF
+                       else f" repos in {org} ", pal["white"] | curses.A_BOLD)])
+            for r in range(y0 + 1, y0 + mh - 1):
+                safe_add(stdscr, r, x0, "│", pal["grey"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+            for i in range(body):
+                idx, yy = mtop + i, y0 + 1 + mpad + i
+                if idx >= len(names):
+                    continue
+                n, m, sel = names[idx], meta[names[idx]], idx == cur
+                mark = "[x]" if n in checked else "[ ]"
+                glyph = REPO_ICONS.get(m["icon"], " ")
+                rv = {lv: curses.A_REVERSE if sel and level == lv else 0
+                      for lv in ("row", "name", "icon")}
+                safe_add(stdscr, yy, x0 + 1,
+                         f" {mark} {n}"[:mw - 23].ljust(mw - 23), pal["white"] | rv["row"])
+                safe_add(stdscr, yy, x0 + mw - 22,
+                         f"{m['short']:<3}"[:3], pal["cyan"] | rv["name"])
+                safe_add(stdscr, yy, x0 + mw - 18,
+                         f"{glyph} {m['icon'] or '-':<13}"[:16], pal["cyan"] | rv["icon"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            hx = x0 + 2
+            for kh, lb in hints[level]:
+                hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
+                              [(f" {kh} ", pal["white"] | curses.A_BOLD),
+                               (f"{lb} ", pal["grey"])])
+            if level == "icon" and filt:
+                draw_tag(stdscr, pal, y0 + mh - 1, hx, [(f" /{filt} ", pal["purple"])])
+            stdscr.refresh()
+            k = stdscr.getch()
+            m = meta[names[cur]] if names else None
+            if level == "row":
+                if k == 27:
+                    return None
+                if k == curses.KEY_RIGHT and names:
+                    level = "name"
+                elif k in (curses.KEY_DOWN, ord("j")):
+                    cur = min(cur + 1, max(0, len(names) - 1))
+                elif k in (curses.KEY_UP, ord("k")):
+                    cur = max(0, cur - 1)
+                elif k == ord(" ") and names:
+                    checked.symmetric_difference_update({names[cur]})
+                elif k in (curses.KEY_ENTER, 10, 13) and names:
+                    return checked
+            elif level == "name":
+                if k in (27, curses.KEY_LEFT, curses.KEY_ENTER, 10, 13):
+                    level = "row"
+                elif k == curses.KEY_RIGHT:
+                    level, filt = "icon", ""
+                elif k in (curses.KEY_BACKSPACE, 127, 8):
+                    m["short"] = m["short"][:-1]
+                elif 32 < k < 127:
+                    ch = chr(k).upper()
+                    m["short"] = ch if len(m["short"]) >= 2 else m["short"] + ch
+            elif level == "icon":
+                if k in (27, curses.KEY_ENTER, 10, 13):
+                    level, filt = "row", ""
+                elif k == curses.KEY_LEFT:
+                    level, filt = "name", ""
+                elif k in (curses.KEY_DOWN, ord("\t")):
+                    m["icon"] = icon_names[(icon_names.index(m["icon"]) + 1) % len(icon_names)]
+                elif k == curses.KEY_UP:
+                    m["icon"] = icon_names[(icon_names.index(m["icon"]) - 1) % len(icon_names)]
+                elif k in (curses.KEY_BACKSPACE, 127, 8):
+                    filt = filt[:-1]
+                elif 32 < k < 127:
+                    filt += chr(k).lower()
+                    cand = next((x for x in icon_names[1:] if x.startswith(filt)),
+                                next((x for x in icon_names[1:] if filt in x), None))
+                    if cand:
+                        m["icon"] = cand
+
+    def help_modal():
+        # built on open so a live nerd_font toggle is reflected. Third field:
+        # the keycodes that flash the row.
+        help_cats = (
+            ("general", (
+                ("?", "this help", (ord("?"),)),
+                ("h", "hold for hints: icons show their trigger keys",
+                 (ord("h"),)),
+                ("q", f"quit (press twice; {keycap('ctrl')}c quits immediately)",
+                 (ord("q"),)),
+                ("c", "toggle compact view (narrow terminals force it)",
+                 (ord("c"),)),
+            )),
+            ("rows", (
+                (f"{keycap('up_down')} / jk", "move selection",
+                 (curses.KEY_UP, curses.KEY_DOWN, ord("j"), ord("k"))),
+                (keycap("enter"), "show details for the selected PR",
+                 (curses.KEY_ENTER, 10, 13)),
+                ("M", "merge, land, stack, update or re-run the selected PR (confirm with y)",
+                 (ord("M"),)),
+                ("y", "yank (copy) the selected PR number", (ord("y"),)),
+                ("Y", "yank (copy) the selected PR link", (ord("Y"),)),
+            )),
+            ("search", (
+                ("/", "fuzzy search the visible rows (PR, branch, title)",
+                 (ord("/"),)),
+            )),
+            ("refresh", (
+                (keycap("esc"), "sync what the current filters show", (27,)),
+                (keycap("space"), "refresh the selected PR only", (ord(" "),)),
+                (keycap("tab"), "toggle auto sync on/off", (9,)),
+                ("w", "toggle fast 'waiting' refresh for the selected PR",
+                 (ord("w"),)),
+            )),
+            ("filter & sort", (
+                ("0", "reset every filter below to its default (org stays)",
+                 (ord("0"),)),
+                (f"{keycap('shift')} key", "any cycle key backwards",
+                 (ord("O"), ord("S"), ord("R"), ord("A"), ord("L"), ord("B"))),
+                # the shifted code sits on both rows, so ⇧R flashes the pair
+                ("o", "cycle organization filter", (ord("o"), ord("O"))),
+                ("s", "cycle state filter: all, open, merged, closed",
+                 (ord("s"), ord("S"))),
+                ("r", "cycle repo filter", (ord("r"), ord("R"))),
+                ("a", "cycle author filter", (ord("a"), ord("A"))),
+                ("l", "cycle last: day, week, month", (ord("l"), ord("L"))),
+                ("b", "cycle sort by: stack, repo, author",
+                 (ord("b"), ord("B"))),
+            )),
+            ("config", (
+                (",", "settings: refresh, restore, repos, authors",
+                 (ord(","),)),
+            )),
+        )
+        flash_ix, flash_until, q_at = set(), 0.0, 0.0
+        while True:
+            now = time.time()
+            height, width = stdscr.getmaxyx()
+            pad = not (compact or width < COMPACT_BELOW)  # spacer between sections
+            lines = []
+            for si, (cat, rows) in enumerate(help_cats):
+                if si and pad:
+                    lines.append(("gap", "", "", ()))
+                lines.append(("hdr", cat, "", ()))
+                lines += [("key", k, d, codes) for k, d, codes in rows]
+            mpad = 1 if pad else 0
+            mw = max(56, min(70, width - 4))
+            mh = min(len(lines) + 2 + 2 * mpad, height - 2)
+            y0, x0 = (height - mh) // 2, (width - mw) // 2
+            stdscr.erase()
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            draw_tag(stdscr, pal, y0, x0 + 2, [(" keys ", pal["white"] | curses.A_BOLD)])
+            for r in range(y0 + 1, y0 + mh - 1):
+                safe_add(stdscr, r, x0, "│", pal["grey"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+            visible = lines[:mh - 2 - 2 * mpad]
+            for i, (kind, k, desc, _) in enumerate(visible):
+                yy = y0 + 1 + mpad + i
+                if kind == "gap":
+                    continue
+                if kind == "hdr":
+                    safe_add(stdscr, yy, x0 + 2,
+                             f"─ {k} " + "─" * max(0, mw - 8 - len(k)),
+                             pal["muted"])  # same divider color as detail modal
+                else:
+                    # flash: black on grey across the full inner width
+                    fl = i in flash_ix and now < flash_until
+                    if fl:
+                        safe_add(stdscr, yy, x0 + 1, " " * (mw - 2), pal["flash"])
+                    # no bold on the band: terminals render bold black as grey
+                    safe_add(stdscr, yy, x0 + 2, f"{k:>9}",
+                             pal["flash"] if fl else pal["white"] | curses.A_BOLD)
+                    safe_add(stdscr, yy, x0 + 13, desc[:mw - 15],
+                             pal["flash"] if fl else pal["grey"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            draw_tag(stdscr, pal, y0 + mh - 1, x0 + 2,
+                     [(" press q again to close ", pal["orange"] | curses.A_BOLD)]
+                     if now - q_at < 2 else [(" q closes ", pal["grey"])])
+            stdscr.refresh()
+            # the modal now holds until qq, so keep the schedules alive
+            if (auto_on and refresh_s and not state["pending"]
+                    and now - state["started"] >= refresh_s):
+                start_fetch()
+            if wait_s and waiting and now - state["w_started"] >= wait_s:
+                start_waiting_fetch()
+            kp = stdscr.getch()
+            if kp == -1:
+                continue
+            if kp == ord("q"):
+                if now - q_at < 2:
+                    return
+                q_at = now
+            else:
+                q_at = 0.0  # any other key withdraws the close intention
+            hit = {i for i, ln in enumerate(visible) if kp in ln[3]}
+            if hit:
+                flash_ix, flash_until = hit, now + HELP_FLASH
+
+    def detail_modal(rows, idx):
+        """Detail card; j/k/arrows move through rows. Returns the final index.
+        Re-reads the live row each tick so watch/refresh updates show at once."""
+        dspin = 0
+
+        def wrap(s, w):
+            out, line = [], ""
+            for word in s.split():
+                if len(line) + len(word) + 1 > w:
+                    out.append(line)
+                    line = word
+                else:
+                    line = f"{line} {word}".strip()
+            if line:
+                out.append(line)
+            return out or [""]
+
+        while True:
+            idx = max(0, min(idx, len(rows) - 1))
+            key = (rows[idx]["repo"], rows[idx]["number"])
+            # render the live copy so background updates appear immediately
+            with lock:
+                mark_chains(state["rows"])
+            row = next((x for x in state["rows"]
+                        if (x["repo"], x["number"]) == key), rows[idx])
+            loading = (key in state["pending_prs"]
+                       or (key[0], STATUS_GROUP[row["status"]]) in state["pending"])
+            dspin = (dspin + 1) % len(SPINNER)
+            height, width = stdscr.getmaxyx()
+            mw = max(50, min(84, width - 4))
+            iw = mw - 4  # inner text width
+            p, f, r, q, cx = row["checks"]
+            ci_g, ci_c = ci_icon(row)
+            def stack_lines():
+                rr = [x for x in state["rows"] if x["repo"] == row["repo"]]
+                ordered, marks = stack_order(sort_rows(rr, "repo"))
+                idx = next((i for i, x in enumerate(ordered)
+                            if x["number"] == row["number"]), None)
+                if idx is None or marks[idx] == "":
+                    return []  # not part of a stack -> section omitted
+                s = idx
+                while s > 0 and marks[s] != "▪":
+                    s -= 1
+                e = s
+                while e < len(marks) - 1 and marks[e] != "└":
+                    e += 1
+                out = []
+                for i in range(s, e + 1):
+                    x = ordered[i]
+                    cur = x["number"] == row["number"]
+                    out.append((f"{rail_mark(marks[i], x)[0]} #{x['number']} {x['branch']}",
+                                "stackcur" if cur else "stack"))
+                return out
+
+            stk = stack_lines()
+            secs = [
+                ("about", [
+                    (f"branch   {row['base']} ← {row['branch']}"
+                     + (f" · behind {row['behind']}" if row.get("behind") else ""), "label"),
+                    (f"repo     {row['repo']} · {row['org']}", "label"),
+                    (f"author   {row['author']} (@{row['login']})", "label"),
+                    (f"age      created {age_str(row['created'])} ago · "
+                     f"updated {age_str(row['updated'])} ago", "label"),
+                ]),
+                ("status", [(f"{icon(row['status'])} {row['status'].upper()}",
+                             STATUS_COLOR.get(row["status"], "value"))]),
+            ]
+            if stk:  # only when the PR is part of a stack
+                secs.append(("stack", stk))
+            secs += [
+                ("reviews", None),
+                ("comments", [(f"{row['comments'][0]} open · {row['comments'][1]} resolved · "
+                               f"{row['comments'][2]} total",
+                               "orange" if row["comments"][0] else
+                               "green" if row["comments"][2] else "label")]),
+                ("ci", [(f"{ci_g} {row['ci']}   {p} passed, {f} failed, "
+                         f"{r} running, {q} queued" + (f", {cx} cancelled" if cx else ""), ci_c)]),
+                ("action", [(f"{icon(row['action'])} {row['action']}",
+                             "green" if row["action"] == "done"
+                             else ACTION_COLOR[row["action"]]),
+                            (ACTION_WHY.get(row["action"], ""), "muted")]
+                 + ([(f"  {st}", "label") for st in fix_steps(
+                     (row.get("stack") or {}).get("number"), row["branch"], row["base"])]
+                    if row["action"] == "rebase" else [])),
+            ]
+            rev = []
+            dec = DECISION_LABEL.get(row["decision"], "no review required")
+            rev.append((dec + (" · outside review needed"
+                               if row.get("ext_review") else ""), "value"))
+            rcolor = {"approved": "green", "changes": "red", "pending": "label"}
+            for rv in row["reviewers"]:
+                c = "me" if rv.get("me") else rcolor.get(rv["state"], "label")
+                if rv.get("team"):  # real name needs read:org; keep any ×N count
+                    name, tag = rv["name"].replace("team", "team review"), ""
+                else:
+                    name = rv["name"]
+                    tag = "" if rv.get("known", True) else " (outsider)"
+                rev.append((f"  {rv['state']:<8} {name}{tag}", c))
+            secs = [(n, rev if n == "reviews" else ls) for n, ls in secs]
+            pad = not (compact or width < COMPACT_BELOW)  # spacer between sections
+            body = []  # (text, color): "hdr" divider, "gap" blank, else text
+            for t in wrap(row["title"], iw):
+                body.append((t, "value"))
+            for name, ls in secs:
+                if pad:
+                    body.append(("", "gap"))
+                body.append((name, "hdr"))
+                body += ls
+
+            mpad = 1 if pad else 0  # blank line inside top and bottom borders
+            mh = min(len(body) + 2 + 2 * mpad, height - 2)
+            y0, x0 = (height - mh) // 2, (width - mw) // 2
+            wkey = key
+            num_clr = pal["purple"] if wkey in waiting else pal["value"]
+            stdscr.erase()
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["border"])
+            draw_tag(stdscr, pal, y0, x0 + 2,
+                     [(f" #{row['number']} ", num_clr | curses.A_BOLD)])
+            if loading:  # fetch in flight: spinner in the top-left border
+                safe_add(stdscr, y0, x0 + 1, SPINNER[dspin], pal["purple"])
+            for r in range(y0 + 1, y0 + mh - 1):  # box sides, incl. padding rows
+                safe_add(stdscr, r, x0, "│", pal["border"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["border"])
+            for i, (t, c) in enumerate(body[:mh - 2 - 2 * mpad]):
+                yy = y0 + 1 + mpad + i
+                if c == "gap":  # blank spacer line
+                    continue
+                if c == "hdr":  # divider
+                    safe_add(stdscr, yy, x0 + 2,
+                             f"─ {t} " + "─" * max(0, mw - 6 - len(t)), pal["muted"])
+                elif c in ("stack", "stackcur"):  # purple rail marker, then row
+                    mk, _, rest = t.partition(" ")
+                    safe_add(stdscr, yy, x0 + 2, mk + " ", pal["purple"])
+                    safe_add(stdscr, yy, x0 + 2 + len(mk) + 1, rest[:iw],
+                             pal["cur" if c == "stackcur" else "label"])
+                else:
+                    safe_add(stdscr, yy, x0 + 2, t[:iw], pal[c])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["border"])
+            watch_lb = "unwatch" if wkey in waiting else "watch"
+            fx2 = x0 + 2
+            tags = [(f"{keycap('up_down')}", "move"),
+                    (keycap("enter"), "open"), (keycap("space"), "refresh"),
+                    ("w", watch_lb)]
+            if row.get("m"):
+                tags.append(("M", row["m"]))
+            if time.time() < toast["until"]:  # a yank note replaces the tags briefly
+                draw_tag(stdscr, pal, y0 + mh - 1, fx2, [(f" {toast['text']} ", pal["green"])])
+                tags = []
+            for kh, lb in tags + ([(keycap("esc"), "close")] if tags else []):
+                fx2 = draw_tag(stdscr, pal, y0 + mh - 1, fx2,
+                               [(f" {kh} ", pal["value"] | curses.A_BOLD),
+                                (f"{lb} ", pal["label"])])
+            stdscr.refresh()
+            # keep refresh/waiting schedules alive while the card is open
+            now = time.time()
+            if (auto_on and refresh_s and not state["pending"]
+                    and now - state["started"] >= refresh_s):
+                start_fetch()
+            if wait_s and waiting and now - state["w_started"] >= wait_s:
+                start_waiting_fetch()
+            k = stdscr.getch()
+            if k in (curses.KEY_DOWN, ord("j")):
+                idx += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                idx -= 1
+            elif k in (curses.KEY_ENTER, 10, 13):
+                webbrowser.open(row["url"])  # stays open
+            elif k == ord(" "):
+                fetch_waiting_pr(key)
+            elif k == ord("w"):
+                waiting.symmetric_difference_update({wkey})
+                if wkey in waiting:
+                    fetch_waiting_pr(wkey)
+            elif k == ord("M") and row.get("m"):
+                merge_flow(*key)
+            elif k in (ord("y"), ord("Y")):
+                yank(row, "number" if k == ord("y") else "url")
+            elif k == 27:
+                return idx
+
+    SETTINGS = (
+        ("refresh", "int", "300", "auto sync seconds, 0 = off"),
+        ("refresh_waiting", "int", "30", "waiting refresh seconds, 0 = off"),
+        ("restore_filters", "bool", "true", "restore filters on start"),
+        ("restore_waiting", "bool", "true", "restore waiting marks on start"),
+        ("search_highlight", "bool", "true", "highlight search matches in rows"),
+        ("search_select_best", "bool", "true", "jump selection to the best match"),
+        ("show_filter_keys", "bool", "false", "show cycle keys in the filter labels"),
+        ("nerd_font", "bool", "true", "use nerd font icons (off = plain text)"),
+        ("repos", "action", "…", "import repos from an organization"),
+        ("authors", "action", "…", "manage authors: name, tag, me"),
+        ("clear cache", "action", "…", "delete the PR cache, then full sync"),
+    )
+
+    def authors_modal():
+        nonlocal authors, author_cycle, me, reload_due
+        auths = [{"name": a.get("name", ""), "tag": a.get("tag", ""),
+                  "me": str(a.get("me")).lower() == "true"} for a in cfg["authors"]]
+        cur, level = 0, "row"
+        hints = {
+            "row": ((keycap("space"), "me"), ("n", "new"), ("x", "delete"),
+                    (keycap("right"), "edit"), (keycap("enter"), "save"),
+                    (keycap("esc"), "cancel")),
+            "name": (("type", "short name"), (keycap("right"), "tag"),
+                     (keycap("left"), "back")),
+            "tag": (("type", "github login"), (keycap("left"), "name"),
+                    (keycap("esc"), "back")),
+        }
+        while True:
+            height, width = stdscr.getmaxyx()
+            mpad = 0 if (compact or width < COMPACT_BELOW) else 1
+            mw = max(60, min(74, width - 4))
+            mh = max(4, min(len(auths) + 2 + 2 * mpad, height - 2))
+            y0, x0 = (height - mh) // 2, (width - mw) // 2
+            stdscr.erase()
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            draw_tag(stdscr, pal, y0, x0 + 2,
+                     [(" authors ", pal["white"] | curses.A_BOLD)])
+            for r in range(y0 + 1, y0 + mh - 1):
+                safe_add(stdscr, r, x0, "│", pal["grey"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+            for i, a in enumerate(auths[:mh - 2 - 2 * mpad]):
+                yy = y0 + 1 + mpad + i
+                sel = i == cur
+                rv = {lv: curses.A_REVERSE if sel and level == lv else 0
+                      for lv in ("row", "name", "tag")}
+                safe_add(stdscr, yy, x0 + 2, f" {a['name']:<10}",
+                         pal["white"] | rv["row"] | rv["name"])
+                safe_add(stdscr, yy, x0 + 14, f"{a['tag']:<32}",
+                         pal["cyan"] | rv["tag"])
+                safe_add(stdscr, yy, x0 + 47, "me" if a["me"] else "  ",
+                         pal["orange"] | curses.A_BOLD)
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            hx = x0 + 2
+            for kh, lb in hints[level]:
+                hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
+                              [(f" {kh} ", pal["white"] | curses.A_BOLD),
+                               (f"{lb} ", pal["grey"])])
+            stdscr.refresh()
+            k = stdscr.getch()
+            a = auths[cur] if auths else None
+            if level == "row":
+                if k == 27:
+                    return
+                if k in (curses.KEY_ENTER, 10, 13):
+                    cfg["authors"] = [{k2: ("true" if v is True else v)
+                                       for k2, v in a2.items() if k2 != "me" or v}
+                                      for a2 in auths if a2["tag"]]
+                    write_authors(cfg_path, cfg["authors"])
+                    authors = {a2["tag"]: a2["name"] for a2 in cfg["authors"]}
+                    author_cycle = [None] + [a2["name"] for a2 in cfg["authors"]]
+                    me = me_tag(cfg)
+                    state["cover"] = {"days": 0, "states": set(), "repos": set()}
+                    reload_due = time.time()
+                    return
+                if k in (curses.KEY_DOWN, ord("j")):
+                    cur = min(cur + 1, max(0, len(auths) - 1))
+                elif k in (curses.KEY_UP, ord("k")):
+                    cur = max(0, cur - 1)
+                elif k == ord(" ") and a:
+                    was = a["me"]
+                    for a2 in auths:
+                        a2["me"] = False
+                    a["me"] = not was
+                elif k == ord("x") and a:
+                    auths.pop(cur)
+                    cur = max(0, min(cur, len(auths) - 1))
+                elif k == ord("n"):
+                    auths.append({"name": "", "tag": "", "me": False})
+                    cur, level = len(auths) - 1, "tag"
+                elif k == curses.KEY_RIGHT and a:
+                    level = "name"
+            elif level in ("name", "tag"):
+                field, cap = ("name", 10) if level == "name" else ("tag", 32)
+                if k in (27, curses.KEY_ENTER, 10, 13):
+                    level = "row"
+                elif k == curses.KEY_LEFT:
+                    level = "row" if level == "name" else "name"
+                elif k == curses.KEY_RIGHT:
+                    level = "tag" if level == "name" else "row"
+                elif k in (curses.KEY_BACKSPACE, 127, 8):
+                    a[field] = a[field][:-1]
+                elif 32 < k < 127 and len(a[field]) < cap:
+                    a[field] += chr(k)
+
+    def settings_modal():
+        nonlocal reload_due
+        cur, edit = 0, None
+
+        def commit(key, value):
+            nonlocal refresh_s, wait_s
+            global NF
+            cfg[key] = value
+            write_config_key(cfg_path, key, value)
+            if key == "refresh":
+                refresh_s = int(value or 0)
+            elif key == "refresh_waiting":
+                wait_s = int(value or 0)
+            elif key == "nerd_font":
+                NF = str(value).lower() != "false"
+
+        while True:
+            height, width = stdscr.getmaxyx()
+            mpad = 0 if (compact or width < COMPACT_BELOW) else 1
+            mw = max(60, min(74, width - 4))
+            mh = len(SETTINGS) + 2 + 2 * mpad
+            y0, x0 = (height - mh) // 2, (width - mw) // 2
+            stdscr.erase()
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            draw_tag(stdscr, pal, y0, x0 + 2,
+                     [(" settings ", pal["white"] | curses.A_BOLD)])
+            for r in range(y0 + 1, y0 + mh - 1):
+                safe_add(stdscr, r, x0, "│", pal["grey"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+            for i, (k, kind, dflt, desc) in enumerate(SETTINGS):
+                yy = y0 + 1 + mpad + i
+                shown = (edit + "_") if (edit is not None and i == cur) \
+                    else ("…" if kind == "action" else str(cfg.get(k, dflt)))
+                attr = curses.A_REVERSE if i == cur else 0
+                safe_add(stdscr, yy, x0 + 2, f" {k:<17}", pal["white"] | attr)
+                safe_add(stdscr, yy, x0 + 20, f"{shown:<7}", pal["cyan"] | attr)
+                safe_add(stdscr, yy, x0 + 28, desc[:mw - 30], pal["grey"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            hx = x0 + 2
+            for kh, lb in ((keycap("up_down"), "move"),
+                           (f"{keycap('enter')}/{keycap('space')}", "edit/toggle"),
+                           (keycap("esc"), "close")):
+                hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
+                              [(f" {kh} ", pal["white"] | curses.A_BOLD),
+                               (f"{lb} ", pal["grey"])])
+            stdscr.refresh()
+            k = stdscr.getch()
+            key_name, kind, dflt, _ = SETTINGS[cur]
+            if edit is not None:
+                if k == 27:
+                    edit = None
+                elif k in (curses.KEY_ENTER, 10, 13):
+                    commit(key_name, edit or dflt)
+                    edit = None
+                elif k in (curses.KEY_BACKSPACE, 127, 8):
+                    edit = edit[:-1]
+                elif ord("0") <= k <= ord("9") and len(edit) < 5:
+                    edit += chr(k)
+                continue
+            if k == 27:
+                return
+            if k in (curses.KEY_DOWN, ord("j")):
+                cur = min(cur + 1, len(SETTINGS) - 1)
+            elif k in (curses.KEY_UP, ord("k")):
+                cur = max(0, cur - 1)
+            elif k in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                if kind == "bool":
+                    commit(key_name,
+                           "false" if str(cfg.get(key_name, dflt)).lower() == "true"
+                           else "true")
+                elif kind == "action":
+                    if key_name == "repos":
+                        repo_sync_modal()
+                    elif key_name == "clear cache":
+                        clear_cache()
+                        for c in caches.values():
+                            c.update(states={}, nodes={})
+                        state["cover"] = {"days": 0, "states": set(), "repos": set()}
+                        reload_due = time.time()
+                        modal_msg("cache cleared, full sync started")
+                        time.sleep(0.8)
+                    else:
+                        authors_modal()
+                else:
+                    edit = ""
+
+    def repo_sync_modal():
+        nonlocal repo_f, org_f, reload_due
+        modal_msg("loading organizations...")
+        me, err = gh_json(["api", "user", "--jq", "{login: .login}"])
+        orgs, err2 = gh_json(["api", "user/orgs", "--paginate", "--jq", "[.[].login]"])
+        if err or err2:
+            modal_msg(f"error: {err or err2}", wait_key=True)
+            return
+        entities = [me["login"]] + sorted(orgs)
+        while True:
+            og = f"{icon('org')} " if NF else ""
+            sel = modal_list("select organization", [f"{og}{e}" for e in entities])
+            if sel is None:
+                return
+            org = entities[sel]
+            modal_msg(f"loading repos of {icon('org')} {org}..." if NF
+                      else f"loading repos of {org}...")
+            repos, err = gh_json(["repo", "list", org, "--limit", "200",
+                                  "--json", "name,url,primaryLanguage"])
+            if err:
+                modal_msg(f"error: {err}", wait_key=True)
+                return
+            names = sorted(r["name"] for r in repos)
+            url_by_name = {r["name"]: r["url"] for r in repos}
+            lang_by_name = {r["name"]: (r.get("primaryLanguage") or {}).get("name", "")
+                            for r in repos}
+            cfg_by_slug = {repo_slug(r["url"]): r for r in cfg["repos"]}
+            checked = {n for n in names if f"{org}/{n}" in cfg_by_slug}
+            meta = {}
+            for n in names:
+                old = cfg_by_slug.get(f"{org}/{n}", {})
+                meta[n] = {"short": old.get("name", n[:2].upper()),
+                           "icon": old.get("icon", LANG_ICON.get(lang_by_name[n], ""))}
+            result = modal_repos(org, names, checked, meta)
+            if result is None:
+                return
+            break
+        kept = [r for r in cfg["repos"] if repo_slug(r["url"]).split("/")[0] != org]
+        for n in sorted(result):
+            entry = {"name": meta[n]["short"], "url": url_by_name[n]}
+            if meta[n]["icon"]:
+                entry["icon"] = meta[n]["icon"]
+            kept.append(entry)
+        cfg["repos"] = kept
+        write_repos(cfg_path, kept)
+        repo_f = None
+        org_list[:] = sorted({repo_slug(r["url"]).split("/")[0] for r in kept})
+        if org_f not in org_list:  # its last repo was just removed
+            org_f = None
+        state["cover"] = {"days": 0, "states": set(), "repos": set()}
+        reload_due = time.time()  # refetch on next tick
+
+    def fetch_waiting_pr(key):
+        if any(rn == key[0] for rn, _ in state["pending"]) or key in state["pending_prs"]:
+            return
+        state["pending_prs"].add(key)
+
+        def work():
+            repo = next(r for r in cfg["repos"] if r["name"] == key[0])
+            try:
+                node, err = fetch_pr(repo, key[1])
+                if node and not err:
+                    fetch_behind(*repo_slug(repo["url"]).split("/"), [node])
+            except Exception as e:
+                node, err = None, str(e)
+            with lock:
+                if node and not err:
+                    cache_of(repo)["nodes"][str(node["number"])] = node  # saved on next sync
+                    row = build_rows(repo, [node], authors, True, me)[0]
+                    state["rows"] = [r for r in state["rows"]
+                                     if (r["repo"], r["number"]) != key] + [row]
+                state["pending_prs"].discard(key)
+        threading.Thread(target=work, daemon=True).start()
+
+    def modal_box(title, lines, keys):
+        """Dialog: lines are lists of (text, attr) segments ([] = blank line),
+        keys are (keycap, label) tags on the bottom border. Returns the key."""
+        height, width = stdscr.getmaxyx()
+        pad = not (compact or width < COMPACT_BELOW)
+        mpad = 1 if pad else 0
+        mw = max(50, min(76, width - 4))
+        mh = min(len(lines) + 2 + 2 * mpad, height - 2)
+        y0, x0 = (height - mh) // 2, (width - mw) // 2
+        stdscr.erase()
+        safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["border"])
+        draw_tag(stdscr, pal, y0, x0 + 2, [(f" {title} ", pal["value"] | curses.A_BOLD)])
+        for r in range(y0 + 1, y0 + mh - 1):
+            safe_add(stdscr, r, x0, "│", pal["border"])
+            safe_add(stdscr, r, x0 + mw - 1, "│", pal["border"])
+        for i, segs in enumerate(lines[:mh - 2 - 2 * mpad]):
+            x = x0 + 2
+            for text, attr in segs:
+                text = text[:max(0, x0 + mw - 2 - x)]
+                safe_add(stdscr, y0 + 1 + mpad + i, x, text, attr)
+                x += len(text)
+        safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["border"])
+        fx = x0 + 2
+        for kh, lb in keys:
+            fx = draw_tag(stdscr, pal, y0 + mh - 1, fx,
+                          [(f" {kh} ", pal["value"] | curses.A_BOLD), (f"{lb} ", pal["label"])])
+        stdscr.refresh()
+        while True:
+            k = stdscr.getch()
+            if k != -1:
+                return k
+
+    def stack_flow(repo, slug, number, offer_merge=False, offer_update=False):
+        """Link the live plain chain through `number` into a native stack:
+        walk it on GitHub, confirm with y, then gh stack link (PR URLs, --base
+        pinned to the bottom's base so link never retargets it)."""
+        owner, name = slug.split("/")
+        modal_msg(f"walking the chain of #{number}...")
+        chain, nodes, err = live_chain(owner, name, number)
+        if err:
+            modal_msg(f"can't stack: {err}", wait_key=True)
+            return
+        if len(chain) < 2:
+            modal_msg(f"#{number} is no longer part of a chain", wait_key=True)
+            return
+        val, lab, warn = pal["value"], pal["label"], pal["orange"]
+        base = nodes[chain[0]]["baseRefName"]
+        lines = [[("link ", lab), (f"{len(chain)} PRs", val), (" onto ", lab), (base, val),
+                  (", bottom to top:", lab)]]
+        for n in chain:
+            nd = nodes[n]
+            lines.append([(f"  #{n} ", val), (f"{nd['baseRefName']} ← {nd['headRefName']}", lab)])
+        in_stack = [n for n in chain if nodes[n].get("stack")]
+        if in_stack:
+            lines.append([("already in a stack: " + " ".join(f"#{n}" for n in in_stack)
+                           + " — link adds the rest to it", lab)])
+        others = [n for n in chain if me is not None
+                  and (nodes[n].get("author") or {}).get("login") != me]
+        if others:
+            lines.append([("⚠ not yours: " + ", ".join(
+                f"#{n} @{(nodes[n].get('author') or {}).get('login', '?')}" for n in others), warn)])
+        drafts = [n for n in chain if nodes[n].get("isDraft")]
+        if drafts:
+            lines.append([("drafts stay drafts: " + " ".join(f"#{n}" for n in drafts), lab)])
+        keys = ([("y", "stack")] + ([("m", f"merge #{number} only")] if offer_merge else [])
+                + ([("u", "update first")] if offer_update else []))
+        k = modal_box(f"stack #{number}", lines, keys + [("any key", "cancel")])
+        if offer_merge and k == ord("m"):
+            return merge_flow(repo["name"], number, force_merge=True)
+        if offer_update and k == ord("u"):
+            return update_flow(repo, slug, number)
+        if k not in (ord("y"), ord("Y")):
+            return
+        modal_msg(f"linking {len(chain)} PRs...")
+        cmd = ["gh", "stack", "link", "--base", base] + [nodes[n]["url"] for n in chain]
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             env={**os.environ, "GH_REPO": slug})
+        text = (out.stderr + out.stdout).strip()
+        if out.returncode != 0:
+            modal_msg(f"failed: {(text.splitlines() or ['gh failed'])[-1]}", wait_key=True)
+        else:
+            modal_msg(f"stacked {' '.join(f'#{n}' for n in chain)}", wait_key=True)
+        for n in chain:
+            fetch_waiting_pr((repo["name"], n))
+
+    def conflict_dialog(title, why, nd):
+        """Explain a conflict and the local steps to fix it; c copies them."""
+        steps = fix_steps((nd.get("stack") or {}).get("number"), nd["headRefName"], nd["baseRefName"])
+        lines = [[(why, pal["orange"])], [("prx can't resolve it — fix it locally:", pal["label"])], []] + [
+            [(f"  {st}", pal["label"] if st.startswith("#") else pal["value"])] for st in steps]
+        k = modal_box(title, lines, [("c", "copy commands"), ("any key", "close")])
+        if k == ord("c"):
+            modal_msg("copied" if copy_text("\n".join(steps)) else "no clipboard tool found")
+            time.sleep(0.8)
+
+    def update_flow(repo, slug, number):
+        """Bring the live chain through `number` up to date, bottom to top:
+        updatePullRequestBranch per layer (rebase on rebase-merge repos, else
+        a merge commit), each layer polled until it is no longer behind
+        before the next starts. Refuses conflicts up front; stops at the
+        first failure (no rollback) and says what was and wasn't updated."""
+        owner, name = slug.split("/")
+        modal_msg(f"walking the chain of #{number}...")
+        chain, nodes, err = live_chain(owner, name, number)
+        if err:
+            modal_msg(f"can't update: {err}", wait_key=True)
+            return
+        clash = [n for n in chain if nodes[n].get("mergeable") == "CONFLICTING"]
+        if clash:
+            return conflict_dialog(f"update #{number}", f"#{clash[0]} has a merge conflict",
+                                   nodes[clash[0]])
+        fetch_behind(owner, name, [nodes[n] for n in chain])
+        if not any((nodes[n].get("_behind") or 0) > 0 for n in chain):
+            modal_msg(f"#{number} is up to date", wait_key=True)
+            for n in chain:
+                fetch_waiting_pr((repo["name"], n))
+            return
+        val, lab, warn = pal["value"], pal["label"], pal["orange"]
+        # chains and stacks always rebase (GitHub's stacked PRs rely on it: a
+        # merge commit leaves the stack needing gh stack rebase); a lone PR
+        # follows the repo, with a merge commit unless it lands with rebase
+        rebase = (len(chain) > 1 or bool(nodes[chain[0]].get("stack"))
+                  or (nodes[chain[0]].get("repository") or {}).get("viewerDefaultMergeMethod") == "REBASE")
+        lines = [[("update ", lab), (f"{len(chain)} PR{'s' if len(chain) > 1 else ''}", val),
+                  (" bottom to top with ", lab), ("rebase" if rebase else "a merge commit", val),
+                  (" each:", lab)]]
+        for n in chain:
+            nd = nodes[n]
+            b = nd.get("_behind")
+            lines.append([(f"  #{n} ", val), (f"{nd['baseRefName']} ← {nd['headRefName']}", lab),
+                          (f"  behind {b}" if b else "  up to date" if b == 0 else "", lab)])
+        others = [n for n in chain if me is not None
+                  and (nodes[n].get("author") or {}).get("login") != me]
+        if others:
+            lines.append([("⚠ not yours: " + ", ".join(
+                f"#{n} @{(nodes[n].get('author') or {}).get('login', '?')}" for n in others)
+                + (" — rewrites their branch" if rebase else ""), warn)])
+        if rebase:
+            lines.append([("⚠ rewrites every branch: local checkouts must reset", warn)])
+        k = modal_box(f"update #{number}", lines, [("y", "update"), ("any key", "cancel")])
+        if k not in (ord("y"), ord("Y")):
+            return
+        done, fail = [], None
+        for i, n in enumerate(chain):
+            nd = nodes[n]
+            modal_msg(f"updating #{n} ({i + 1}/{len(chain)})...")
+            fetch_behind(owner, name, [nd])  # the layer below may just have moved
+            if nd.get("_behind") == 0:
+                done.append(n)
+                continue
+            mutation = ("mutation{updatePullRequestBranch(input:{pullRequestId:%s,updateMethod:%s})"
+                        "{pullRequest{number}}}" % (json.dumps(nd["id"]), "REBASE" if rebase else "MERGE"))
+            try:
+                out = subprocess.run(["gh", "api", "graphql", "-f", f"query={mutation}"],
+                                     capture_output=True, text=True, timeout=GH_TIMEOUT)
+                fail = gh_err(out) if out.returncode != 0 else None
+            except subprocess.TimeoutExpired:
+                fail = f"gh timed out after {GH_TIMEOUT}s"
+            for _ in range(30 if not fail else 0):  # GitHub updates asynchronously
+                time.sleep(2)
+                fetch_behind(owner, name, [nd])
+                if nd.get("_behind") == 0:
+                    break
+            else:
+                fail = fail or "still behind after 60s"
+            if fail:
+                break
+            done.append(n)
+        rest = chain[len(done) + (1 if fail else 0):]
+        msg = "updated " + (" ".join(f"#{n}" for n in done) or "nothing")
+        if fail:
+            msg += f" · failed #{chain[len(done)]}: {fail}"
+        if rest:
+            msg += " · untouched " + " ".join(f"#{n}" for n in rest)
+        for n in chain:
+            fetch_waiting_pr((repo["name"], n))
+        if fail and "conflict" in fail.lower():  # GitHub found a real conflict mid-run
+            return conflict_dialog(f"update #{number}", msg, nodes[chain[len(done)]])
+        modal_msg(msg, wait_key=True)
+
+    def rerun_flow(repo, slug, row):
+        """Re-run the cancelled jobs of each workflow whose newest run was
+        cancelled (gh run rerun --failed: failed and cancelled jobs and what
+        depends on them), after a y confirm; then refresh the PR."""
+        runs = row["rerun"]
+        if not runs:
+            modal_msg(f"#{row['number']}: no cancelled run found", wait_key=True)
+            return
+        val, lab, warn = pal["value"], pal["label"], pal["orange"]
+        lines = [[(row["title"], val)], [], [("re-run the cancelled jobs of:", lab)]]
+        lines += [[(f"  {wf} ", val), (f"run {rid}", lab)] for rid, wf in runs.items()]
+        lines.append([("starts CI that others see and that costs Actions minutes", lab)])
+        if not row["mine"]:
+            lines.append([(f"⚠ not your PR — author @{row['login']}", warn)])
+        k = modal_box(f"rerun #{row['number']}", lines, [("y", "rerun"), ("any key", "cancel")])
+        if k not in (ord("y"), ord("Y")):
+            return
+        ok, fail = [], None
+        for rid in runs:
+            modal_msg(f"re-running run {rid}...")
+            try:
+                out = subprocess.run(["gh", "run", "rerun", str(rid), "--failed", "-R", slug],
+                                     capture_output=True, text=True, timeout=GH_TIMEOUT)
+                fail = gh_err(out) if out.returncode != 0 else None
+            except subprocess.TimeoutExpired:
+                fail = f"gh timed out after {GH_TIMEOUT}s"
+            if fail:
+                break
+            ok.append(rid)
+        msg = "re-running " + (", ".join(runs[r] for r in ok) or "nothing")
+        modal_msg(msg + (f" · failed: {fail}" if fail else ""), wait_key=True)
+        fetch_waiting_pr((repo["name"], row["number"]))
+
+    def merge_flow(repo_name, number, force_merge=False):
+        """M: refetch, recheck, confirm with y, then merge (gh pr merge, SHA
+        pinned), land (gh stack merge up to this PR), or stack (gh stack link,
+        see stack_flow) — whatever the row's M target is. force_merge: the
+        stack dialog's m escape, merge a ready chain bottom on its own."""
+        repo = next((r for r in cfg["repos"] if r["name"] == repo_name), None)
+        if not repo:
+            return
+        slug = repo_slug(repo["url"])
+        modal_msg(f"checking #{number}...")
+        for attempt in range(3):  # GitHub computes merge state lazily: UNKNOWN first
+            try:
+                node, err = fetch_pr(repo, number)
+            except Exception as e:
+                node, err = None, str(e)
+            if err or not node or node.get("mergeStateStatus") != "UNKNOWN":
+                break
+            time.sleep(1.5)
+        if node and not err:  # the M target depends on drift: count it fresh too
+            fetch_behind(*slug.split("/"), [node])
+        if err or not node:
+            modal_msg(f"error: {err or 'PR not found'}", wait_key=True)
+            return
+        row = build_rows(repo, [node], authors, True, me)[0]
+        key = (repo_name, number)
+        with lock:
+            state["rows"] = [r for r in state["rows"]
+                             if (r["repo"], r["number"]) != key] + [row]
+            mark_chains(state["rows"])
+        bottom_stack = row["action"] == "stack" and not row.get("parent_pr")
+        act = "merge" if force_merge and bottom_stack else row.get("m")
+        if act == "stack":
+            return stack_flow(repo, slug, number, offer_merge=bottom_stack,
+                              offer_update=row["upd"])
+        if act == "update":
+            return update_flow(repo, slug, number)
+        if act == "rerun":
+            return rerun_flow(repo, slug, row)
+        if act not in ("merge", "land"):
+            act = row["action"]
+            modal_msg(f"#{number} is now {act}: {ACTION_WHY[act]}", wait_key=True)
+            return
+        val, lab, warn = pal["value"], pal["label"], pal["orange"]
+        ital = val | getattr(curses, "A_ITALIC", 0)
+        method = row["method"].lower()
+        st = row["stack"] if act == "land" else None
+        if st and not gh_stack_installed():
+            bottom = st["layers"][0]["number"]
+            k = modal_box(f"#{number}", [
+                [(f"#{number} is layer {st['position']} of stack #{st['number']}", val)],
+                [],
+                [("Options:", lab)],
+                [("- merge bottom ", lab), (f"#{bottom}", ital), (" first", lab)],
+                [("- install ", lab), (GH_STACK_INSTALL, ital)],
+            ], [("b", "merge bottom"), ("c", "copy install cmd"), (keycap("esc"), "cancel")])
+            if k == ord("b"):
+                merge_flow(repo_name, bottom)
+            elif k == ord("c"):
+                modal_msg("copied" if copy_text(GH_STACK_INSTALL) else "no clipboard tool found")
+                time.sleep(0.8)
+            return
+        into = st and row["default_branch"] or row["base"]
+        lines = [[(row["title"], val)], [], [(f"{method} into ", lab), (into, val)]]
+        if st:
+            nums = " ".join(f"#{ly['number']}" for ly in st["layers"])
+            lines.append([("lands ", lab), (nums, val),
+                          (f" (stack #{st['number']}, all or nothing)", lab)])
+        lines.append([("branch will be deleted" if row["delete_branch"] else "branch kept", lab)])
+        if row["merge_queue"]:
+            lines.append([("base uses a merge queue: this queues, not merges", lab)])
+        if st:
+            others = [ly for ly in st["layers"] if me is None or ly["login"] != me]
+            if others:
+                lines.append([("⚠ not yours: " + ", ".join(
+                    f"#{ly['number']} @{ly['login']}" for ly in others), warn)])
+        else:
+            if not row["mine"]:
+                lines.append([(f"⚠ not your PR — author @{row['login']}", warn)])
+            # native stacks restack on GitHub; plain children need a manual rebase
+            kids = [] if row["stack"] else [
+                r for r in state["rows"] if r["repo"] == repo_name
+                and r["base"] == row["branch"] and r["status"] in ("open", "draft")]
+            if kids:
+                lines.append([("⚠ rebase --onto after: " + " ".join(
+                    f"#{r['number']}" for r in kids), warn)])
+        offer_stack = (act == "merge" and not force_merge and linkable(row)
+                       and bool(row.get("kids")))
+        keys = ([("y", act)] + ([("s", "stack chain")] if offer_stack else [])
+                + ([("u", "update first")] if row["upd"] else []))
+        k = modal_box(f"{act} #{number}", lines, keys + [("any key", "cancel")])
+        if offer_stack and k == ord("s"):
+            return stack_flow(repo, slug, number)
+        if row["upd"] and k == ord("u"):
+            return update_flow(repo, slug, number)
+        if k not in (ord("y"), ord("Y")):
+            return
+        env = None
+        if st:
+            # the stack number: gh stack merge then takes every layer, all or nothing
+            cmd = ["gh", "stack", "merge", str(st["number"]), "--merge-method", method, "--yes"]
+            env = {**os.environ, "GH_REPO": slug}
+        else:
+            cmd = ["gh", "pr", "merge", str(number), "-R", slug, f"--{method}",
+                   "--match-head-commit", row["head_oid"]]
+        modal_msg(f"{'landing' if st else 'merging'} #{number}...")
+        out = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        text = (out.stderr + out.stdout).strip()
+        if out.returncode != 0:
+            modal_msg(f"failed: {(text.splitlines() or ['gh failed'])[-1]}", wait_key=True)
+        elif row["merge_queue"] or "queue" in text.lower():
+            modal_msg(f"#{number} added to the merge queue", wait_key=True)
+        else:
+            modal_msg("landed " + " ".join(f"#{ly['number']}" for ly in st["layers"]) if st
+                      else f"merged #{number}", wait_key=True)
+        for n in ([ly["number"] for ly in st["layers"]] if st else [number]):
+            fetch_waiting_pr((repo_name, n))
+
+    def fetch_repo_page1(repo):
+        """Upsert the newest OPEN page so new PRs appear between full
+        refreshes. No prune — the full refresh handles vanished rows, and
+        the display filter drops rows that age out of the time window."""
+        if any(rn == repo["name"] for rn, _ in state["pending"]):
+            return
+
+        def work():
+            try:
+                owner, name = repo_slug(repo["url"]).split("/")
+                nodes, _, err = fetch_page(owner, name, "OPEN", None)
+                if err or not nodes:
+                    return
+                carry_behind(cache_of(repo)["nodes"], nodes)
+                new = build_rows(repo, nodes, authors, show_all, me)
+                nums = {r["number"] for r in new}
+                with lock:
+                    state["rows"] = [r for r in state["rows"]
+                                     if r["repo"] != repo["name"]
+                                     or r["number"] not in nums] + new
+            except Exception:
+                pass  # next tick retries
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_waiting_fetch():
+        state["w_started"] = time.time()
+        for key in waiting:
+            fetch_waiting_pr(key)
+        for repo in scope()[2]:  # keep the list itself fresh too
+            fetch_repo_page1(repo)
+
+    start_fetch()
+    while True:
+        with lock:
+            mark_chains(state["rows"])  # upserts rebuild rows without chain context
+        rows = filter_rows(state["rows"], state_f, window)
+        if author_f:
+            rows = [r for r in rows if r["author"] == author_f]
+        if repo_f:
+            rows = [r for r in rows if r["repo"] == repo_f]
+        if search_q:
+            rows = [r for r in rows if fuzzy_match(search_q, r)]
+
+        def order(rs):
+            if by == "stack":
+                return stack_order(sort_rows(rs, "repo"))
+            rs = sort_rows(rs, by)
+            heads = {(r["repo"], r["branch"]) for r in rs}
+            bases = {(r["repo"], r["base"]) for r in rs}
+            return rs, ["▪" if (r["repo"], r["base"]) in heads  # is a child
+                        or (r["repo"], r["branch"]) in bases    # is a parent
+                        else "" for r in rs]
+
+        # display list: per-org sections ("hdr") when showing all orgs
+        show_hdr = org_f is None and len(org_list) > 1
+        lines = []
+        for org in (org_list if org_f is None else [org_f]):
+            sub = [r for r in rows if r["org"] == org]
+            if not sub:
+                continue
+            sub, marks = order(sub)
+            if show_hdr:
+                if lines:  # spacer between sections, none before the first
+                    lines.append(("blank", "", ""))
+                lines.append(("hdr", org,
+                              f" {len(sub)} {icon('pr')}"))
+                lines.append(("colhdr", "", ""))
+            lines += [("row", r, m) for r, m in zip(sub, marks)]
+        if widen and not reload_due and not state["pending"]:
+            widen = False
+        if widen:
+            lines.append(("loading", "", ""))
+        selectable = [i for i, ln in enumerate(lines) if ln[0] == "row"]
+        if snap_best:
+            snap_best = False
+            if search_q and selectable and \
+                    str(cfg.get("search_select_best", "true")).lower() != "false":
+                scores = [fuzzy_score(search_q, lines[li][1]) for li in selectable]
+                cursor, top = scores.index(max(scores)), 0
+        if selectable:
+            cursor = max(0, min(cursor, len(selectable) - 1))
+        cur_row = lines[selectable[cursor]][1] if selectable else None
+
+        height, width = stdscr.getmaxyx()
+        cw = compact or width < COMPACT_BELOW  # effective compact view
+        hdr_line = HEADER_C if cw else HEADER
+        # sections carry their own column header; otherwise a blank line and
+        # the fixed header sit between the top bar and the content
+        y_start = 2 if show_hdr else 4
+        body = height - 1 - y_start
+        top = max(0, min(top, max(0, len(lines) - body)))
+        if selectable:
+            top, up, down = scroll_window(len(lines), body, top, selectable[cursor])
+        else:
+            up, down = False, False
+        # "↑ N more" / "↓ N more" replace the edge lines while rows hide there
+        up_n = sum(1 for i in selectable if i <= top) if up else 0
+        down_n = sum(1 for i in selectable if i >= top + body - 1) if down else 0
+
+        stdscr.erase()
+        spin = (spin + 1) % len(SPINNER)
+        ind = SPINNER[spin] if state["pending"] else "·"
+        border, bold = pal["border"], curses.A_BOLD
+
+        keymode = show_keys or time.time() < peek_until
+        # nerd font off: labels always lead with the trigger key (grey at rest,
+        # bold when peeking); with nerd font: icon at rest, bold key on peek
+        lead = (pal["value"] | bold) if keymode else pal["label"]
+
+        def flead(k):  # leading glyph for filter k: icon or trigger key
+            return keycap(FILTER_KEY[k]) if (keymode or not NF) else icon("f_" + k)
+
+        x = draw_tag(stdscr, pal, 0, 1, [(f" {flead('org')} ", lead),
+                     ("org ", pal["label"]), (f"{org_f or 'all'} ", pal["value"] | bold)])
+        auto = " auto " if auto_on else " manual "
+        at = (f" last sync {since_str(state['at'])} ago " if state["at"]
+              else f" restored {since_str(state['restored'])} ago " if state.get("restored")
+              else " loading ")
+        rx = max(x, width - len(auto) - len(at) - 3)
+        rx = draw_tag(stdscr, pal, 0, rx, [(auto, pal["label"])])
+        draw_tag(stdscr, pal, 0, rx, [(at, pal["label"]), (ind, pal["purple"])])
+        prs = f" {len(selectable)} {icon('pr')}"
+        draw_tag(stdscr, pal, 1, max(1, width - len(prs) - 1), [(prs, pal["accent"])])
+        x = 1
+        for k, val in (
+            ("state", state_f),
+            ("repo", repo_f or "all"),
+            ("author", author_f or "all"),
+            ("last", window),
+            ("sort", by),
+        ):
+            name = FILTER_LABEL.get(k, k)
+            parts = [(f" {flead(k)} ", lead), (f"{name} ", pal["label"]),
+                     (f"{val} ", pal["value"] | bold)]
+            x = draw_tag(stdscr, pal, 1, x, parts)
+
+        act_hdr_x = max(2, width - ACTW)
+        if not show_hdr:
+            safe_add(stdscr, 3, 2, hdr_line, pal["label"] | bold)
+            safe_add(stdscr, 3, act_hdr_x, "ACTION", pal["label"] | bold)
+        for y, ln in enumerate(lines[top:top + body]):
+            yy = y + y_start
+            if (y == 0 and up) or (y == body - 1 and down):
+                safe_add(stdscr, yy, 2, f"↑ {up_n} more" if y == 0 and up
+                         else f"↓ {down_n} more", pal["muted"])
+                continue
+            if ln[0] == "blank":
+                continue
+            if ln[0] == "hdr":
+                og = f"{icon('org')} " if NF else ""
+                lbl = f"─ {og}{ln[1]} "
+                # stop at width-2: filling the last cell throws in addstr,
+                # which leaves ncurses repainting the line from a stale model
+                text = lbl + "─" * max(0, width - 3 - len(lbl))
+                safe_add(stdscr, yy, 2, text, pal["accent"])
+                safe_add(stdscr, yy, max(2, width - len(ln[2]) - 1),
+                         ln[2], pal["accent"])
+                continue
+            if ln[0] == "loading":
+                scope_lbl = " · ".join(p for p in (
+                    repo_f, None if state_f == "all" else state_f, window) if p)
+                busy = sorted({rn for rn, _ in state["pending"]})
+                safe_add(stdscr, yy, 2, f"{SPINNER[spin]} loading {scope_lbl}"
+                         + (f" · {', '.join(busy)}" if busy else ""), pal["muted"])
+                continue
+            if ln[0] == "colhdr":
+                safe_add(stdscr, yy, 2, hdr_line, pal["label"] | bold)
+                safe_add(stdscr, yy, act_hdr_x, "ACTION", pal["label"] | bold)
+                continue
+            row, mark = ln[1], ln[2]
+            sel = curses.A_REVERSE if (selectable and top + y == selectable[cursor]) else 0
+            if sel:
+                safe_add(stdscr, yy, 1, " " * (width - 2), sel)
+            segs = row_segments(row, cw)
+            pr_i = 1 if cw else 2  # index of the PR number segment
+            key = (row["repo"], row["number"])
+            group = STATUS_GROUP[row["status"]]
+            if (row["repo"], group) in state["pending"] or key in state["pending_prs"]:
+                segs[0] = (f"{SPINNER[spin]}  ", "purple")
+            if key in waiting:
+                segs[pr_i] = (segs[pr_i][0], "purple")  # PR number column
+            mark, mclr = rail_mark(mark, row)
+            segs.insert(pr_i, (f"{mark:<2}", mclr))  # stack rail
+            if search_q and str(cfg.get("search_highlight", "true")).lower() != "false":
+                pat = match_pattern(search_q)
+                if pat:
+                    segs = highlight_segs(segs, pat)
+            act_x = max(2, width - ACTW)
+            x = 2
+            for text, clr in segs:
+                safe_add(stdscr, yy, x, text[:max(0, act_x - 1 - x)], pal[clr] | sel)
+                x += len(text)
+            text, clr = action_segment(row)
+            safe_add(stdscr, yy, act_x, text, pal[clr] | sel)
+
+        fx = 1
+        if search_q is not None:
+            fx = draw_tag(stdscr, pal, height - 1, fx,
+                          [(f" /{search_q}{'_' if search_edit else ''} ",
+                            pal["purple"] | bold)])
+        if time.time() - last_q < 2:
+            draw_tag(stdscr, pal, height - 1, fx,
+                     [(" press q again to quit ", pal["orange"] | curses.A_BOLD)])
+        elif time.time() < toast["until"]:
+            draw_tag(stdscr, pal, height - 1, fx, [(f" {toast['text']} ", pal["green"])])
+        elif state["errors"]:
+            draw_tag(stdscr, pal, height - 1, fx,
+                     [(f" {state['errors'][0]} ", pal["red"])])
+        else:
+            # (action name or None, key name, label). peek or nerd-off -> the
+            # key (keycap); otherwise the action icon. search-edit has no
+            # action icons, so it always shows the key.
+            hints = (((None, "enter", "keep"), (None, "esc", "clear"))
+                     if search_edit
+                     else (("quit", "q", "quit"), ("settings", ",", "settings"),
+                           (None, "h", "hints"), ("help", "?", "help")))
+            x = fx
+            for action, key_name, label in hints:
+                if action and NF and not keymode:
+                    hint = icon(action)
+                else:
+                    hint = keycap(key_name)
+                x = draw_tag(stdscr, pal, height - 1, x,
+                             [(f" {hint} ", lead), (f"{label} ", pal["label"])])
+            if not search_edit and cur_row:
+                # the selected row's most practical key: right-aligned, key only (no icon)
+                hk, hl = row_hint(cur_row, (cur_row["repo"], cur_row["number"]) in waiting)
+                tag = [(f" {hk} ", lead), (f"{hl} ", pal["label"])]
+                rx = width - 2 - sum(len(t) for t, _ in tag)
+                if rx > x:
+                    draw_tag(stdscr, pal, height - 1, rx, tag)
+        stdscr.refresh()
+
+        snap = (window, by, state_f, org_f, repo_f, author_f, auto_on, compact,
+                tuple(sorted(waiting)))
+        if snap != last_snap:
+            last_snap = snap
+            save_state(state_path, {
+                "window": window, "by": by, "state": state_f, "org": org_f,
+                "repo": repo_f, "author": author_f, "auto_on": auto_on,
+                "compact": compact,
+                "waiting": sorted(list(w) for w in waiting)})
+
+        if (auto_on and refresh_s and not state["pending"]
+                and time.time() - state["started"] >= refresh_s):
+            start_fetch()
+        if reload_due and time.time() >= reload_due and not state["pending"]:
+            reload_due = None
+            start_fetch()
+        if waiting:  # a waiting PR that merged/closed is done: stop watching it
+            waiting -= {(r["repo"], r["number"]) for r in state["rows"]
+                        if r["status"] in ("merged", "closed")}
+        if wait_s and waiting and time.time() - state["w_started"] >= wait_s:
+            start_waiting_fetch()
+
+        def cyc(seq, cur, step):
+            return seq[(seq.index(cur) + step) % len(seq)]
+
+        key = stdscr.getch()
+        if search_edit and key != -1:  # search input captures printable keys
+            if key == 27:
+                search_q, search_edit = None, False
+            elif key in (curses.KEY_ENTER, 10, 13):
+                search_edit = False
+                if not search_q.strip():  # empty/whitespace query: cancel
+                    search_q = None
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                search_q = search_q[:-1]
+            elif 32 <= key < 127:
+                search_q += chr(key)
+            else:
+                pass  # arrows etc. are ignored while typing
+            cursor, top, snap_best = 0, 0, True
+            key = -1
+        step = -1 if key in (ord("S"), ord("R"), ord("L"),
+                             ord("B"), ord("A"), ord("O")) else 1
+        if key == ord("q"):
+            if time.time() - last_q < 2:
+                return
+            last_q = time.time()
+        elif key != -1:
+            last_q = 0.0  # any other key withdraws the quit intention
+        if key == ord(","):
+            settings_modal()
+        elif key == 27:
+            start_fetch()  # refresh everything the current filters show
+        elif key == ord("0"):  # reset all filters/sort/search to defaults (org stays)
+            state_f, window, by = "all", "week", "stack"
+            author_f = repo_f = search_q = None
+            search_edit = False
+            cursor, top = 0, 0
+            reload_due = time.time() + 3 if coverage_missing() else None
+            widen = widen or reload_due is not None
+        elif key in (ord("r"), ord("R")):
+            repo_f = cyc(repos_of(org_f), repo_f, step)
+            cursor, top = 0, 0
+        elif key in (ord("s"), ord("S")):
+            state_f = cyc(STATE_FILTERS, state_f, step)
+            cursor, top = 0, 0
+        elif key in (ord("b"), ord("B")):
+            by = cyc(("stack", "repo", "author"), by, step)
+            cursor, top = 0, 0
+        elif key in (ord("l"), ord("L")):
+            window = cyc(WINDOWS, window, step)
+            cursor, top = 0, 0
+        elif key in (ord("a"), ord("A")):
+            author_f = cyc(author_cycle, author_f, step)
+            cursor, top = 0, 0
+        elif key in (ord("o"), ord("O")):
+            org_f = cyc([None] + org_list, org_f, step)
+            if repo_f not in repos_of(org_f):  # a repo filter from another org
+                repo_f = None
+            cursor, top = 0, 0
+        elif key == ord("/"):
+            search_edit = True
+            search_q = search_q or ""
+            cursor, top = 0, 0
+        elif key == ord("?"):
+            help_modal()
+        if key in (ord("s"), ord("S"), ord("l"), ord("L"),
+                   ord("r"), ord("R"), ord("o"), ord("O")):
+            # widened scope: reload after a 3s debounce (org: immediately,
+            # switching orgs is a deliberate choice); narrowed: cancel
+            if not coverage_missing():
+                reload_due = None
+            elif key in (ord("o"), ord("O")):
+                reload_due, widen = time.time(), True
+            else:
+                reload_due, widen = time.time() + 3, True
+        elif key == 9:  # Tab
+            auto_on = not auto_on
+        elif key == ord("c"):
+            compact = not compact
+        elif key == ord("h"):
+            peek_until = time.time() + PEEK_HOLD  # hold for hints; repeats extend it
+        elif key == ord("w") and cur_row:
+            wkey = (cur_row["repo"], cur_row["number"])
+            waiting.symmetric_difference_update({wkey})
+            if wkey in waiting:  # just turned on: refresh now, then on the next tick
+                fetch_waiting_pr(wkey)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            cursor += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            cursor = max(0, cursor - 1)
+        elif key in (curses.KEY_ENTER, 10, 13) and cur_row:
+            sel_rows = [lines[li][1] for li in selectable]
+            cursor = detail_modal(sel_rows, cursor)
+        elif key == ord(" ") and cur_row:
+            fetch_waiting_pr((cur_row["repo"], cur_row["number"]))
+        elif key == ord("M") and cur_row and cur_row.get("m"):
+            merge_flow(cur_row["repo"], cur_row["number"])
+        elif key in (ord("y"), ord("Y")) and cur_row:
+            yank(cur_row, "number" if key == ord("y") else "url")
+        elif key == curses.KEY_RESIZE:
+            top = 0
+
+
+def selftest():
+    bare = {"number": 1, "title": "t", "url": "u", "state": "OPEN", "isDraft": False, "commits": {"nodes": []}}
+    threads = {"totalCount": 3, "nodes": [{"isResolved": False}, {"isResolved": True}, {"isResolved": True}]}
+    assert classify(dict(bare, reviewThreads=threads))["comments"] == [1, 2, 3]  # open, resolved, total
+    assert classify(bare)["comments"] == [0, 0, 0]  # cached before threads were fetched
+    assert fix_steps(14575, "feat/b", "feat/a")[:2] == ["gh stack checkout 14575", "gh stack rebase"]
+    assert fix_steps(None, "feat/b", "feat/a")[1:3] == ["git switch feat/b", "git rebase origin/feat/a"]
+    def run(name, concl, at, wf="Label Checker", num=1):
+        return {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": concl,
+                "startedAt": at, "checkSuite": {"workflowRun": {"runNumber": num, "databaseId": 900 + num,
+                                                               "workflow": {"name": wf}}}}
+    stale = {"state": "FAILURE", "contexts": {"nodes": [  # failed, then re-run green
+        run("labels", "FAILURE", "2026-10-02T10:39:19Z"), run("labels", "SUCCESS", "2026-10-02T11:23:16Z"),
+        run("labels", "FAILURE", "2026-10-02T09:00:00Z", wf="Other")]}}
+    assert ci_of(stale) == ("RED", [1, 1, 0, 0, 0])  # same name, other workflow: its own check
+    stale["contexts"]["nodes"].pop()
+    assert ci_of(stale) == ("GREEN", [1, 0, 0, 0, 0])
+    assert ci_of({"state": "PENDING"}) == ("YELLOW", [0, 0, 0, 0, 0])  # no contexts: rollup state
+    cancelled = {"state": "FAILURE", "contexts": {"nodes": [  # run cancelled before its matrix expanded
+        run("Tests (${{ matrix.shard.name }})", "CANCELLED", "2026-10-05T13:31:39Z", wf="CI", num=18415),
+        run("Tests (aqua | trx)", "SUCCESS", "2026-10-05T13:36:09Z", wf="CI", num=18416)]}}
+    assert ci_of(cancelled) == ("GREEN", [1, 0, 0, 0, 0])
+    cut = {"state": "FAILURE", "contexts": {"nodes": [  # newest run cancelled, nothing after it
+        run("Build", "CANCELLED", "2026-10-05T13:31:39Z", wf="CI", num=7), run("Lint", "SUCCESS", "t", wf="Lint")]}}
+    assert ci_of(cut) == ("CANCELLED", [1, 0, 0, 0, 1]) and rerun_ids(cut) == {907: "CI"}
+    cut["contexts"]["nodes"].append(run("Unit", "FAILURE", "t", wf="Unit"))
+    assert ci_of(cut)[0] == "RED"  # a real failure outranks a cancelled run
+    assert gh_transient("gh: HTTP 502") == "retry" and gh_transient("HTTP 504: Gateway Timeout") == "retry"
+    assert gh_transient("You have exceeded a secondary rate limit") == "limit"
+    assert gh_transient("unexpected end of JSON input") == "retry"
+    assert gh_transient("HTTP 404: Not Found") is None and gh_transient("HTTP 401: Bad credentials") is None
+    assert age_str(iso_days_ago(21)) == "21d" and age_str(iso_days_ago(0)) == "0d"
+    assert age_str(iso_days_ago(500)) == "99d" and age_str("") == "-"
+    now = time.time()
+    assert since_str(now) == "0s" and since_str(now - 59) == "59s"
+    assert since_str(now - 60) == "1m" and since_str(now - 3599) == "59m"
+    assert since_str(now - 3600) == "1h" and since_str(now - 86399) == "23h"
+    assert since_str(now - 86400) == "1d" and since_str(now - 6 * 86400) == "6d"
+    assert since_str(now - 7 * 86400) == "1w" and since_str(now + 99) == "0s"
+    assert since_str(now - 999 * 86400) == "54w"  # capped
+    node = {"number": 7, "title": "t", "url": "u", "state": "OPEN", "isDraft": False,
+            "createdAt": iso_days_ago(3),
+            "author": {"login": "mf"}, "reviewDecision": "APPROVED",
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "headRefName": "feat/x",
+            "latestOpinionatedReviews": {"nodes": [{"state": "APPROVED", "author": {"login": "al"}}]},
+            "reviewRequests": {"nodes": [{"requestedReviewer": {"login": "sa"}}]},
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                "state": "SUCCESS",
+                "contexts": {"nodes": [
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"__typename": "StatusContext", "state": "SUCCESS"},
+                ]}}}}]}}
+    def brow(**kw):
+        return build_rows({"name": "be"}, [node], {}, True, **kw)[0]
+    row = brow()
+    assert (row["status"], row["review"], row["ci"], row["action"]) == \
+        ("open", "reviewed", "GREEN", "merge"), row
+    assert row["checks"] == [3, 0, 0, 0, 0], row
+    assert ci_icon(row) == (icon("ci_pass"), "green")
+    assert ci_icon({"checks": [9, 2, 0, 0, 0]}) == (icon("ci_fail"), "red")
+    assert ci_icon({"checks": [4, 0, 0, 0, 3]}) == (icon("ci_cancel"), "grey")
+    assert ci_icon({"checks": [1, 0, 9, 0, 0]}) == (icon("ci_run"), "yellow")
+    assert ci_icon({"checks": [1, 0, 0, 3, 0]}) == (icon("ci_queue"), "grey")
+    assert ci_icon({"checks": [0, 0, 0, 0, 0]}) == ("-", "grey")
+    # esc/enter/space print the same symbol with or without a nerd font
+    assert keycap("esc", False) == keycap("esc", True) == "␛"
+    assert keycap("x", True) == "x"  # unlisted key resolves to itself
+    assert set(ACTION_WHY) == set(ACTION_COLOR)  # detail modal covers every action
+    r3 = build_rows({"name": "be"}, [node], {"other": "O"}, True, me="sa")[0]
+    assert r3["ext_review"] is True, r3  # pending request from outside known authors
+    assert [rv["me"] for rv in r3["reviewers"]] == [False, True], r3
+    assert row["branch"] == "feat/x"
+    cs = row_segments(row, True)
+    assert len(cs) == 5 and cs[1][0].startswith("#7"), cs  # status PR CI branch title
+    assert len(row_segments(row)) > len(cs)
+    global NF
+    NF = False  # ASCII fallback path
+    assert ci_icon(row) == ("✓", "green"), ci_icon(row)
+    fseg = row_segments(row)
+    assert fseg[0][0].startswith("○"), fseg  # open status char, no nerd glyph
+    assert fseg[1][0] == "be ", fseg  # repo short name, no icon prefix
+    assert action_segment({"action": "ready"})[0].strip() == "ready"
+    rvs = {"reviewers": [{"name": "A", "state": "approved"}, {"name": "B", "state": "changes"},
+                         {"name": "team×2", "state": "pending", "team": True},
+                         {"name": "C", "state": "pending", "known": True},
+                         {"name": "me", "state": "pending", "me": True}]}
+    def rev(rs):
+        return "".join(t for t, _ in reviewer_segments({"reviewers": rs}))
+    assert rev(rvs["reviewers"]) == "-1 ?3 ?me", rev(rvs["reviewers"])  # changes win
+    assert rev(rvs["reviewers"][:1]) == "+1 ?0    "  # zero slots stay visible
+    assert rev([dict(rvs["reviewers"][0], me=True)]) == "+1 ?0 +me"  # my approval
+    NF = True
+    assert [(rv["login"], rv["state"]) for rv in row["reviewers"]] == \
+        [("al", "approved"), ("sa", "pending")], row
+    node.update(mergeable="CONFLICTING")
+    assert brow()["action"] == "rebase"
+    node.update(mergeable="MERGEABLE", isDraft=True)
+    r = brow()
+    assert (r["status"], r["action"]) == ("draft", "ready"), r
+    assert brow(me="sa")["action"] == "review"  # my review requested beats all
+    node.update(isDraft=False, state="MERGED", updatedAt=iso_days_ago(3))
+    r = brow()
+    assert (r["status"], r["action"]) == ("merged", "done"), r
+    assert filter_rows([r], "open", "month") == [] and filter_rows([r], "all", "month") == [r]
+    assert filter_rows([r], "merged", "month") == [r] and filter_rows([r], "closed", "month") == []
+    assert filter_rows([r], "all", "day") == [] and filter_rows([r], "all", "week") == [r]
+    node.update(state="OPEN", reviewDecision=None, mergeStateStatus="BEHIND")
+    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"state": "PENDING"}
+    r = brow()
+    assert (r["review"], r["ci"], r["action"]) == ("pending", "YELLOW", "wait"), r
+    # off the default branch: plain stack child holds, other bases block,
+    # native stack layers land once every unmerged layer of the stack is ready
+    node.update(reviewDecision="APPROVED", mergeStateStatus="CLEAN", baseRefName="feat/p",
+                repository={"defaultBranchRef": {"name": "development"}},
+                baseRef={"associatedPullRequests": {"nodes": [{"number": 6}]}})
+    node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"state": "SUCCESS"}
+    assert brow()["action"] == "hold"
+    node["baseRef"] = None
+    assert brow()["action"] == "blocked"
+
+    def layer(n, mss):
+        return {"number": n, "state": "OPEN", "isDraft": False, "reviewDecision": "APPROVED",
+                "mergeable": "MERGEABLE", "mergeStateStatus": mss, "author": {"login": "mf"},
+                "latestOpinionatedReviews": {"nodes": []},
+                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}}
+    node.update(mergeStateStatus="BLOCKED", stackEntry={"position": 2}, stack={
+        "number": 99, "size": 2, "entries": {"nodes": [
+            {"position": 2, "pullRequest": layer(7, "BLOCKED")},
+            {"position": 1, "pullRequest": layer(6, "CLEAN")}]}})
+    r = brow()
+    assert r["action"] == "land" and [ly["number"] for ly in r["stack"]["layers"]] == [6, 7], r
+    node["stack"]["entries"]["nodes"].append(
+        {"position": 0, "pullRequest": dict(layer(5, "BLOCKED"), state="MERGED")})
+    assert brow()["action"] == "land"  # merged layers below don't count
+    node["stack"]["entries"]["nodes"][1]["pullRequest"]["mergeStateStatus"] = "BLOCKED"
+    assert brow()["action"] == "chase"  # bottom not CLEAN: no land
+    node.update(baseRefName="development", mergeStateStatus="CLEAN")
+    assert brow()["action"] == "merge"  # stack not ready: its bottom merges like any PR
+    node["stack"]["entries"]["nodes"][1]["pullRequest"]["mergeStateStatus"] = "CLEAN"
+    assert brow()["action"] == "land"  # whole stack ready: the bottom lands too
+    top = dict(layer(8, "BLOCKED"))
+    top["commits"] = {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}
+    node["stack"]["entries"]["nodes"].append({"position": 3, "pullRequest": top})
+    node.update(baseRefName="feat/p")
+    assert brow()["action"] == "chase"  # a layer above isn't ready: no land anywhere
+    node["stack"]["entries"]["nodes"].pop()
+    r = brow()
+    assert r["action"] == "land" and [ly["number"] for ly in r["stack"]["layers"]] == [6, 7], r
+    # plain chain 1 <- 2 <- 3: with gh-stack every ready layer offers stack
+    global STACK_LINK
+
+    def chain_row(n, base, parent):
+        node.update(number=n, headRefName=f"b{n}", baseRefName=base, stack=None, stackEntry=None,
+                    baseRef={"associatedPullRequests": {"nodes": [{"number": parent}] if parent else []}})
+        return brow()
+    chain = [chain_row(1, "development", None), chain_row(2, "b1", 1), chain_row(3, "b2", 2)]
+    assert [r["action"] for r in mark_chains(chain)] == ["merge", "hold", "hold"]
+    STACK_LINK = True
+    assert [r["action"] for r in mark_chains(chain)] == ["stack", "stack", "stack"]
+    assert [r["kids"] for r in chain] == [[2], [3], []]
+    assert [r["m"] for r in chain] == ["stack", "stack", "stack"]
+    for r in chain:
+        r["method"] = "MERGE"  # a lone merge keeps the layers above valid: no stack action
+    assert [r["action"] for r in mark_chains(chain)] == ["merge", "hold", "hold"]
+    assert [r["m"] for r in chain] == ["merge", "stack", "stack"]  # linking stays on M
+    chain[2]["ci"] = "YELLOW"  # not ready: the action says wait, M still links
+    assert (mark_chains(chain)[2]["action"], chain[2]["m"]) == ("wait", "stack")
+    assert mark_chains(chain[:1])[0]["action"] == "merge"  # lone PR: nothing to link
+    tree = chain[:2] + [chain_row(4, "b1", 1)]  # 1 <- 2 and 1 <- 4: a stack can't fork
+    assert [r["action"] for r in mark_chains(tree)] == ["merge", "hold", "hold"]
+    assert [r["m"] for r in tree] == ["merge", None, None]  # trees never link
+    assert row_hint(tree[0], False) == ("M", "merge")
+    # out of date: trunk-only drift stays quiet, drift inside a chain marks it all
+    STACK_LINK = False
+    d = [chain_row(1, "development", None), chain_row(2, "b1", 1), chain_row(3, "b2", 2)]
+    d[0]["behind"] = 5  # bottom behind trunk only: M offers update where it has nothing better
+    assert [r["action"] for r in mark_chains(d)] == ["merge", "hold", "hold"]
+    assert [r["m"] for r in d] == ["merge", "update", "update"]
+    d[2]["behind"] = 1  # top behind its parent: no layer lands before the chain is updated
+    assert [r["action"] for r in mark_chains(d)] == ["update", "update", "update"]
+    d[1]["mergeable"] = "CONFLICTING"  # the update would be refused: offered nowhere
+    assert [(r["action"], r["m"]) for r in mark_chains(d)] == [("merge", "merge"), ("rebase", None), ("hold", None)]
+    lone = chain_row(9, "development", None)
+    lone["merge_state"] = "BEHIND"  # the repo requires up to date
+    assert mark_chains([lone])[0]["action"] == "update"
+    assert row_hint(dict(tree[1], action="wait"), False) == ("w", "watch")
+    assert row_hint(dict(tree[1], action="wait"), True) == (keycap("enter"), "details")
+    STACK_LINK = False
+    ups = {1: None, 2: 1, 3: 2, 4: 1}
+    assert walk_chain(2, lambda n: (ups[n], None), lambda n: ([3] if n == 2 else [2] if n == 1 else [], None)) == ([1, 2, 3], None)
+    ch, err = walk_chain(3, lambda n: (ups[n], None), lambda n: ([2, 4] if n == 1 else [], None))
+    assert ch is None and "linear" in err  # tree: 1 has two open children
+    assert walk_chain(1, lambda n: (2, None), lambda n: ([], None))[1] == "chain loops or is too long"
+    assert scroll_window(10, 5, 0, 0) == (0, False, True)
+    assert scroll_window(10, 5, 0, 4) == (1, True, True)  # markers hide both edge lines
+    assert scroll_window(10, 5, 2, 9) == (5, True, False)
+    assert scroll_window(4, 5, 0, 3) == (0, False, False)  # everything fits
+    import tempfile as _tf
+    global CACHE_DIR
+    CACHE_DIR, real_dir = _tf.mkdtemp(), CACHE_DIR
+    c = {"slug": "o/r", "fragment": FRAGMENT_SHA, "states": {},
+         "nodes": {"1": {"updatedAt": iso_days_ago(1)}, "2": {"updatedAt": iso_days_ago(40)}}}
+    save_cache(c)
+    assert list(load_cache("o/r")["nodes"]) == ["1"]  # older than CACHE_DAYS: pruned
+    assert load_cache("o/other") is None  # file per slug
+    c["fragment"] = "old"
+    save_cache(c)
+    assert load_cache("o/r") is None  # other query shape: ignored, full sync
+    clear_cache()
+    assert os.listdir(CACHE_DIR) == []
+    CACHE_DIR = real_dir
+    sp = _tf.mktemp(suffix=".json")
+    save_state(sp, {"window": "day", "waiting": [["be", 7]]})
+    st = load_state(sp)
+    assert st["window"] == "day" and st["waiting"] == [["be", 7]], st
+    os.unlink(sp)
+    assert load_state("/nonexistent/state.json") == {}
+    fr = {"number": 14135, "branch": "feat/ABC-142", "title": "Export the monthly Widget report"}
+    assert fuzzy_match("142", fr) and fuzzy_match("abc142", fr) and fuzzy_match("ABC-142", fr)
+    assert fuzzy_match("14135", fr) and fuzzy_match("widget", fr)
+    assert fuzzy_match("14", fr) and fuzzy_match("ABC-14", fr)  # short = prefix
+    assert fuzzy_match("1", fr) and fuzzy_match("ab", fr)       # never blank early
+    assert not fuzzy_match("xyz9", fr)
+    assert highlight_segs([("feat/ABC-142 x", "grey")], match_pattern("142")) == \
+        [("feat/", "grey"), ("ABC-142", "hl"), (" x", "grey")]
+    assert match_pattern("widget").search("a Widget chat")
+    f2 = {"number": 14116, "branch": "feat/ABC-161", "title": "ABC-161 Unlock"}
+    assert not fuzzy_match("116", f2)  # 3+ digits: exact ticket, no #14116 bleed
+    assert fuzzy_match("161", f2) and fuzzy_match("14116", f2) and fuzzy_match("11", f2) is False
+    f3 = {"number": 9, "branch": "feat/ABC-1160", "title": "x"}
+    assert not fuzzy_match("ABC-116", f3)      # no prefix bleed into ABC-1160
+    assert fuzzy_score("14135", fr) > fuzzy_score("142", fr) > fuzzy_score("14", fr)
+    cfg = parse_config("# c\nrefresh: 60\nrepos:\n  - name: be\n    url: 'https://github.com/o/r'\nauthors:\n  - name: m\n    tag: mf\n")
+    assert cfg["repos"] == [{"name": "be", "url": "https://github.com/o/r"}], cfg
+    assert cfg["refresh"] == "60", cfg
+    assert repo_slug("https://github.com/o/r.git") == "o/r"
+    r2 = build_rows({"name": "be", "icon": "nodejs"}, [node], {}, True)[0]
+    assert r2["repo_icon"] == REPO_ICONS["nodejs"], r2
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write("refresh: 300\nrepos:\n  - name: XX\n    url: https://github.com/o/x\nauthors:\n  - name: m\n    tag: mf\n# tail comment\n")
+    write_authors(f.name, [{"name": "M", "tag": "mfu", "me": "true"},
+                           {"name": "A", "tag": "aaa"}])
+    cfga = parse_config(open(f.name).read())
+    assert cfga["authors"] == [{"name": "M", "tag": "mfu", "me": "true"},
+                               {"name": "A", "tag": "aaa"}], cfga
+    assert me_tag(cfga) == "mfu"
+    write_config_key(f.name, "refresh", "120")
+    write_config_key(f.name, "restore_filters", "false")
+    cfgk = parse_config(open(f.name).read())
+    assert cfgk["refresh"] == "120" and cfgk["restore_filters"] == "false", cfgk
+    assert cfgk["repos"], cfgk  # rest of the file preserved
+    write_repos(f.name, [{"name": "FE", "url": "https://github.com/o/fe", "icon": "react"}])
+    cfg2 = parse_config(open(f.name).read())
+    assert cfg2["repos"] == [{"name": "FE", "url": "https://github.com/o/fe", "icon": "react"}], cfg2
+    assert cfg2["authors"][0]["tag"] == "mfu" and cfg2["refresh"] == "120", cfg2
+    os.unlink(f.name)
+    pa = {"repo": "be", "branch": "b1", "base": "development"}
+    ch = {"repo": "be", "branch": "b2", "base": "b1"}
+    ch2 = {"repo": "be", "branch": "b3", "base": "b2"}
+    solo = {"repo": "be", "branch": "b9", "base": "development"}
+    ordered, marks = stack_order([solo, pa, ch2, ch])
+    assert ordered == [solo, pa, ch, ch2], ordered
+    assert marks == ["", "▪", "├", "└"], marks
+    print("selftest OK")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="prx",
+        description="TUI for open GitHub PRs across configured repos and authors. "
+                    "Shows PR number, status (draft/open/merged/closed), review "
+                    "(pending/reviewed/changes), CI (GREEN/YELLOW/RED), and action "
+                    "(ready/merge/conflict/blocked). Uses the gh CLI for auth and API access.",
+        epilog="Config (YAML, default ~/.config/prx/prx.yaml):\n"
+               "  repos:\n    - name: backend\n      url: https://github.com/org/backend\n"
+               "  authors:\n    - name: robin\n      tag: robin-gh-login\n\n"
+               "Optional top-level keys (TUI only): refresh: 300 (auto-refresh seconds),\n"
+               "refresh_waiting: 30 (fast refresh for rows marked waiting with 'w').\n"
+               "If authors are configured, only their PRs are shown (override with --all).\n"
+               "See prx(1) for full details.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default=CONFIG_DEFAULT, help="config file path")
+    p.add_argument("--plain", action="store_true", help="print table to stdout, no TUI (for scripts/agents)")
+    p.add_argument("--json", action="store_true", help="print PRs as JSON to stdout, no TUI")
+    p.add_argument("--all", action="store_true", help="show PRs from all authors, not just configured ones")
+    p.add_argument("--state", choices=STATE_FILTERS, default="all",
+                   help="state filter for --plain/--json output (TUI: cycle with s; default: all)")
+    p.add_argument("--author", metavar="NAME",
+                   help="only PRs by this author (short name or GitHub login) in --plain/--json output "
+                        "(TUI: cycle with a)")
+    p.add_argument("--window", choices=WINDOWS, default="week",
+                   help="time window: only PRs updated in the last day/week/month, "
+                        "1/7/30 days from now (TUI: cycle with l; default: week)")
+    p.add_argument("--by", choices=["stack", "repo", "author"], default="stack",
+                   help="sort for --plain output; 'stack' = repo sort with stacked PRs grouped "
+                        "(TUI: cycle with b; default: stack)")
+    p.add_argument("--refresh", type=int, metavar="SEC",
+                   help="TUI auto-refresh interval in seconds, 0 disables (default: config 'refresh' key, else 300)")
+    p.add_argument("--clear-cache", action="store_true",
+                   help=f"delete the TUI's PR cache ({CACHE_DIR}) and exit")
+    p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    args = p.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+    if args.clear_cache:
+        clear_cache()
+        return
+    try:
+        with open(args.config) as f:
+            cfg = parse_config(f.read())
+    except FileNotFoundError:
+        sys.exit(f"prx: config not found: {args.config} (see prx --help for format)")
+    if not cfg["repos"]:
+        sys.exit("prx: no repos configured")
+
+    global STACK_LINK
+    STACK_LINK = gh_stack_installed()
+    if args.json or args.plain:
+        rows, errors = gather(cfg, args.all)
+        rows = filter_rows(rows, args.state, args.window)
+        if args.author:
+            rows = [r for r in rows if args.author in (r["author"], r["login"])]
+        if args.json:
+            print(json.dumps({"prs": rows, "errors": errors}, indent=2))
+        else:
+            print_plain(rows, errors, args.by)
+        if errors:
+            sys.exit(1)
+    else:
+        os.environ.setdefault("ESCDELAY", "25")  # snappy Esc, arrows still work via keypad
+        refresh_s = args.refresh if args.refresh is not None else int(cfg.get("refresh", 300) or 0)
+        wait_s = int(cfg.get("refresh_waiting", 30) or 0)
+        try:
+            curses.wrapper(tui, cfg, args.config, args.all, refresh_s, wait_s)
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
