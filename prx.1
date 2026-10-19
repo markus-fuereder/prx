@@ -278,8 +278,10 @@ its own column header and PR count. Switching to an organization clears a
 repo filter from another organization.
 .TP
 .B s
-Cycle the state filter: all, open (includes drafts), merged, closed. No
-sync needed; merged/closed rows show \fB-\fR as action.
+Cycle the state filter: all, open (includes drafts), merged, closed. A state
+already synced shows at once; one not synced yet gets a sync 3 seconds after
+the last keypress (see \fB--refresh\fR). Merged/closed rows show \fB-\fR as
+action.
 .TP
 .B r
 Cycle the repo filter: all, then each configured repository \(em only the
