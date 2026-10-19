@@ -249,7 +249,7 @@ footer shows only the essentials; \fB?\fR opens a modal listing every key with
 a short description. It closes on \fBq q\fR only, like quitting; pressing any
 other key highlights the line that key belongs to for about half a second, so
 the modal doubles as a key trainer. A shifted cycle key (\fBShift+r\fR and
-friends) highlights two lines: its own and the \fBShift\fR line. Auto sync
+friends) highlights two lines: its own and the \fBShift\fR line. Auto-sync
 and the waiting schedule keep running while it is open.
 .P
 The footer's right end shows the most practical key for the selected row,
@@ -279,7 +279,7 @@ repo filter from another organization.
 .TP
 .B s
 Cycle the state filter: all, open (includes drafts), merged, closed. No
-refetch needed; merged/closed rows show \fB-\fR as action.
+sync needed; merged/closed rows show \fB-\fR as action.
 .TP
 .B r
 Cycle the repo filter: all, then each configured repository \(em only the
@@ -326,7 +326,7 @@ to overwrite), right again the icon (up/down steps through the named icons,
 typing filters them). Short name and icon are prefilled from the repo name and
 its primary language. \fBEnter\fR at row level writes the selection to the
 config file (checked repos of that org are added or updated, unchecked ones
-removed; other orgs untouched) and refetches. \fBEsc\fR cancels.
+removed; other orgs untouched) and syncs. \fBEsc\fR cancels.
 .IP
 \fIauthors\fR manages author entries: short name, GitHub login tag, and the
 \fIme\fR flag; space sets me exclusively, n adds, x deletes, enter saves to the
@@ -352,7 +352,7 @@ line under the last row shows a spinner, the scope, and the repos still in
 flight, e.g. \fI⠼ loading month · FE, DE\fR. Plain syncs don't show it.
 .TP
 .B Tab
-Toggle auto sync on/off (the top bar shows \fIauto\fR or \fImanual\fR).
+Toggle auto-sync on/off (the top bar shows \fIauto\fR or \fImanual\fR).
 Next to it, \fIlast sync 42s ago\fR gives the age of the last completed
 fetch. One unit, largest that fits: \fBs\fR under a minute, then \fBm\fR,
 \fBh\fR, \fBd\fR, \fBw\fR, capped at \fB54w\fR.
@@ -402,13 +402,13 @@ state), comments (review threads: open, resolved, total \(em plain
 conversation comments can't be resolved and are not counted), CI check counts, and action (the next move with its reason). All from data already fetched. \fBj\fR/\fBk\fR
 or the arrow keys move to the previous/next row without leaving the card.
 \fBEnter\fR opens the PR in the browser (the card stays open), \fBSpace\fR
-refetches the PR the card is showing, \fBw\fR toggles
+refreshes the PR the card is showing, \fBw\fR toggles
 waiting for it (the number turns purple), \fBM\fR merges, lands or stacks it
 (see MERGING; only shown when \fBM\fR does something on the PR), and
 \fBEsc\fR closes (keeping the row you landed on selected). The card updates live as watch or refresh data
 arrives; a spinner in the top-left border marks a fetch in flight.
 .SH MERGING
-\fBM\fR (main view or detail card) refetches the PR and recomputes its action; only a
+\fBM\fR (main view or detail card) refreshes the PR and recomputes its action; only a
 fresh \fImerge\fR, \fIland\fR or \fIstack\fR (see \fBM\fR under TUI KEYS)
 continues. A confirm dialog then shows the
 merge method (the repository's \fIviewerDefaultMergeMethod\fR, e.g.
@@ -419,7 +419,7 @@ stacked children that need \fBgit rebase --onto\fR afterwards. \fBy\fR
 confirms, any other key cancels.
 .P
 \fImerge\fR runs \fBgh pr merge\fR with \fB--match-head-commit\fR pinned to
-the refetched head, so a push after the check makes the merge fail instead of
+the refreshed head, so a push after the check makes the merge fail instead of
 merging unseen commits. \fB--admin\fR is never used.
 .P
 \fIland\fR runs \fBgh stack merge\fR (the \fBgh-stack\fR extension) with

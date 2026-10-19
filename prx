@@ -307,8 +307,8 @@ def fetch_behind(owner, name, nodes):
 
 
 def carry_behind(cached, nodes):
-    """Keep the last known behind count on refetched nodes until the next
-    compare (same head commit only)."""
+    """Keep the last known behind count on nodes from a sync or refresh until
+    the next compare (same head commit only)."""
     for n in nodes:
         old = cached.get(str(n["number"]))
         if old and "_behind" in old and "_behind" not in n and old.get("headRefOid") == n.get("headRefOid"):
@@ -1387,7 +1387,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
              "pending_prs": set(), "w_started": 0.0,
              "cover": {"days": 0, "states": set(), "repos": set()}}
     lock = threading.Lock()
-    reload_due = None
+    sync_due = None
     caches = {}  # repo name -> cache dict (see load_cache); only the TUI uses it
     cache_lock = threading.Lock()  # own lock: callers may already hold `lock`
 
@@ -1713,7 +1713,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             ("refresh", (
                 (keycap("esc"), "sync what the current filters show", (27,)),
                 (keycap("space"), "refresh the selected PR only", (ord(" "),)),
-                (keycap("tab"), "toggle auto sync on/off", (9,)),
+                (keycap("tab"), "toggle auto-sync on/off", (9,)),
                 ("w", "toggle fast 'waiting' refresh for the selected PR",
                  (ord("w"),)),
             )),
@@ -1982,7 +1982,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                 return idx
 
     SETTINGS = (
-        ("refresh", "int", "300", "auto sync seconds, 0 = off"),
+        ("refresh", "int", "300", "auto-sync seconds, 0 = off"),
         ("refresh_waiting", "int", "30", "waiting refresh seconds, 0 = off"),
         ("restore_filters", "bool", "true", "restore filters on start"),
         ("restore_waiting", "bool", "true", "restore waiting marks on start"),
@@ -1996,7 +1996,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
     )
 
     def authors_modal():
-        nonlocal authors, author_cycle, me, reload_due
+        nonlocal authors, author_cycle, me, sync_due
         auths = [{"name": a.get("name", ""), "tag": a.get("tag", ""),
                   "me": str(a.get("me")).lower() == "true"} for a in cfg["authors"]]
         cur, level = 0, "row"
@@ -2054,7 +2054,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                     author_cycle = [None] + [a2["name"] for a2 in cfg["authors"]]
                     me = me_tag(cfg)
                     state["cover"] = {"days": 0, "states": set(), "repos": set()}
-                    reload_due = time.time()
+                    sync_due = time.time()
                     return
                 if k in (curses.KEY_DOWN, ord("j")):
                     cur = min(cur + 1, max(0, len(auths) - 1))
@@ -2087,7 +2087,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                     a[field] += chr(k)
 
     def settings_modal():
-        nonlocal reload_due
+        nonlocal sync_due
         cur, edit = 0, None
 
         def commit(key, value):
@@ -2164,7 +2164,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                         for c in caches.values():
                             c.update(states={}, nodes={})
                         state["cover"] = {"days": 0, "states": set(), "repos": set()}
-                        reload_due = time.time()
+                        sync_due = time.time()
                         modal_msg("cache cleared, full sync started")
                         time.sleep(0.8)
                     else:
@@ -2173,7 +2173,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                     edit = ""
 
     def repo_sync_modal():
-        nonlocal repo_f, org_f, reload_due
+        nonlocal repo_f, org_f, sync_due
         modal_msg("loading organizations...")
         me, err = gh_json(["api", "user", "--jq", "{login: .login}"])
         orgs, err2 = gh_json(["api", "user/orgs", "--paginate", "--jq", "[.[].login]"])
@@ -2222,7 +2222,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
         if org_f not in org_list:  # its last repo was just removed
             org_f = None
         state["cover"] = {"days": 0, "states": set(), "repos": set()}
-        reload_due = time.time()  # refetch on next tick
+        sync_due = time.time()  # sync on next tick
 
     def fetch_waiting_pr(key):
         if any(rn == key[0] for rn, _ in state["pending"]) or key in state["pending_prs"]:
@@ -2460,7 +2460,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
         fetch_waiting_pr((repo["name"], row["number"]))
 
     def merge_flow(repo_name, number, force_merge=False):
-        """M: refetch, recheck, confirm with y, then merge (gh pr merge, SHA
+        """M: refresh, recheck, confirm with y, then merge (gh pr merge, SHA
         pinned), land (gh stack merge up to this PR), or stack (gh stack link,
         see stack_flow) — whatever the row's M target is. force_merge: the
         stack dialog's m escape, merge a ready chain bottom on its own."""
@@ -2644,7 +2644,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                               f" {len(sub)} {icon('pr')}"))
                 lines.append(("colhdr", "", ""))
             lines += [("row", r, m) for r, m in zip(sub, marks)]
-        if widen and not reload_due and not state["pending"]:
+        if widen and not sync_due and not state["pending"]:
             widen = False
         if widen:
             lines.append(("loading", "", ""))
@@ -2822,8 +2822,8 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
         if (auto_on and refresh_s and not state["pending"]
                 and time.time() - state["started"] >= refresh_s):
             start_fetch()
-        if reload_due and time.time() >= reload_due and not state["pending"]:
-            reload_due = None
+        if sync_due and time.time() >= sync_due and not state["pending"]:
+            sync_due = None
             start_fetch()
         if waiting:  # a waiting PR that merged/closed is done: stop watching it
             waiting -= {(r["repo"], r["number"]) for r in state["rows"]
@@ -2867,8 +2867,8 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             author_f = repo_f = search_q = None
             search_edit = False
             cursor, top = 0, 0
-            reload_due = time.time() + 3 if coverage_missing() else None
-            widen = widen or reload_due is not None
+            sync_due = time.time() + 3 if coverage_missing() else None
+            widen = widen or sync_due is not None
         elif key in (ord("r"), ord("R")):
             repo_f = cyc(repos_of(org_f), repo_f, step)
             cursor, top = 0, 0
@@ -2897,14 +2897,14 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             help_modal()
         if key in (ord("s"), ord("S"), ord("l"), ord("L"),
                    ord("r"), ord("R"), ord("o"), ord("O")):
-            # widened scope: reload after a 3s debounce (org: immediately,
+            # widened scope: sync after a 3s debounce (org: immediately,
             # switching orgs is a deliberate choice); narrowed: cancel
             if not coverage_missing():
-                reload_due = None
+                sync_due = None
             elif key in (ord("o"), ord("O")):
-                reload_due, widen = time.time(), True
+                sync_due, widen = time.time(), True
             else:
-                reload_due, widen = time.time() + 3, True
+                sync_due, widen = time.time() + 3, True
         elif key == 9:  # Tab
             auto_on = not auto_on
         elif key == ord("c"):

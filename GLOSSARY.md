@@ -47,5 +47,46 @@ Use them exactly as defined here.
   A delta sync is only valid when covered-since is at or before the current
   window's cutoff; otherwise that state gets a full sync.
 
+**time window**
+: How far back the list reaches: PRs updated in the last day, week, or month
+  (`l` cycles it). Filters on `updatedAt`. Its **cutoff** is the oldest
+  `updatedAt` it admits.
+
+**auto-sync**
+: The sync that repeats on a timer (`refresh` config key, default 300
+  seconds). `Tab` toggles it.
+
+**waiting**
+: A mark on one PR (`w`). The **waiting schedule** refreshes waiting PRs on
+  the `refresh_waiting` interval, on top of the sync. The mark clears itself
+  once the PR is merged or closed. The PR number turns purple while it is set.
+
+**action**
+: The next move prx suggests for a PR, shown in the ACTION column and the
+  detail card (`review`, `update`, `merge`, `land`, `stack`, `hold`, `blocked`,
+  `wait`, and so on). `M` does what the action says.
+
+**stack**
+: PRs chained by base branch: each PR's base branch is the head branch of the
+  PR below it. The **root** is the bottom PR. Each PR in a stack is a
+  **layer**. A **plain stack** is chained only by base branches; a **native
+  stack** is linked as a GitHub stack. Also the `stack` action: link a plain
+  stack into a native one with gh-stack.
+
+**chain**
+: The layers of one stack from bottom to top, as `M` walks them on GitHub.
+  Includes PRs hidden by the time window or filters.
+
+**tree**
+: A branch with two or more open PRs based on it. A stack can't hold a tree,
+  so prx refuses to link one.
+
+**land**
+: Merge a whole native stack in one go. The `land` action shows only when
+  every unmerged layer is ready and none is BLOCKED.
+
+Don't use synonyms for these words: not "refetch" for refresh, not "reload"
+for sync.
+
 Config keys keep their historic names: `refresh` is the auto-sync interval,
 and `refresh_waiting` is the waiting schedule's refresh interval.
