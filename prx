@@ -499,7 +499,7 @@ def classify(node):
     review = {"APPROVED": "reviewed", "CHANGES_REQUESTED": "changes"}.get(decision, "pending")
     commits = node["commits"]["nodes"]
     rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
-    ci, (passed, failed, running, queued, cancelled) = ci_of(rollup)
+    ci, (passed, failed, running, queued, canceled) = ci_of(rollup)
     threads = node.get("reviewThreads") or {}
     merge_state = node.get("mergeStateStatus")
     repo = node.get("repository") or {}
@@ -528,7 +528,7 @@ def classify(node):
         "reviewers": reviewers,
         "status": status, "review": review, "decision": decision,
         "ci": ci, "mergeable": node.get("mergeable"), "merge_state": merge_state,
-        "checks": [passed, failed, running, queued, cancelled],
+        "checks": [passed, failed, running, queued, canceled],
         "rerun": rerun_ids(rollup) if ci == "CANCELLED" else {},
         # review threads: [open, resolved, total]; open counts the first 100
         "comments": [sum(not t["isResolved"] for t in threads.get("nodes", [])),
@@ -547,9 +547,9 @@ def classify(node):
 
 def newest_checks(rollup):
     """The head commit's checks that count. Checks that ran again on the same
-    commit (a re-run, a label event, a run cancelled by a newer push of the
+    commit (a re-run, a label event, a run canceled by a newer push of the
     same workflow) count only with the newest: per Actions workflow, only its
-    newest run's checks (a run cancelled early can carry unexpanded matrix
+    newest run's checks (a run canceled early can carry unexpanded matrix
     names like `Tests (${{ matrix.x }})`, so names alone don't match); then
     per check name, its newest start. That is what GitHub's PR page shows."""
     nodes = ((rollup or {}).get("contexts") or {}).get("nodes", [])
@@ -578,7 +578,7 @@ def newest_checks(rollup):
 
 def rerun_ids(rollup):
     """{workflow run id: workflow name} for runs whose counting checks were
-    cancelled — what gh run rerun --failed restarts."""
+    canceled — what gh run rerun --failed restarts."""
     out = {}
     for c in newest_checks(rollup):
         r = (c.get("checkSuite") or {}).get("workflowRun") or {}
@@ -589,19 +589,19 @@ def rerun_ids(rollup):
 
 def ci_of(rollup):
     """(GREEN/YELLOW/RED/CANCELLED/-, [passed, failed, running, queued,
-    cancelled]) for one head commit, from newest_checks. A cancelled run is
+    canceled]) for one head commit, from newest_checks. A canceled run is
     no result, not a failure: CANCELLED (rerun) unless something failed or
-    still runs. GitHub's own rollup state counts stale and cancelled runs as
+    still runs. GitHub's own rollup state counts stale and canceled runs as
     failures, so it is only the fallback when no contexts came back."""
     nodes = ((rollup or {}).get("contexts") or {}).get("nodes", [])
-    passed = failed = running = queued = cancelled = 0
+    passed = failed = running = queued = canceled = 0
     for c in newest_checks(rollup):
         if c.get("__typename") == "CheckRun":
             if c.get("status") == "COMPLETED":
                 if c.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED"):
                     passed += 1
                 elif c.get("conclusion") == "CANCELLED":
-                    cancelled += 1
+                    canceled += 1
                 else:
                     failed += 1
             elif c.get("status") == "IN_PROGRESS":
@@ -619,8 +619,8 @@ def ci_of(rollup):
               "PENDING": "YELLOW", "EXPECTED": "YELLOW"}.get(state, "-")
     else:  # EXPECTED: a required status hasn't reported yet
         ci = ("RED" if failed else "YELLOW" if running or queued or state == "EXPECTED"
-              else "CANCELLED" if cancelled else "GREEN" if passed else "-")
-    return ci, [passed, failed, running, queued, cancelled]
+              else "CANCELLED" if canceled else "GREEN" if passed else "-")
+    return ci, [passed, failed, running, queued, canceled]
 
 
 def layer_ok(pr):
@@ -989,12 +989,12 @@ FILTER_KEY = {"org": "o", "state": "s", "repo": "r",
               "author": "a", "last": "l", "sort": "b"}
 # label shown in the bar; the internal name stays (state.json keys, ICON names)
 FILTER_LABEL = {"sort": "by"}
-STATUS_COLOR = {"open": "green", "draft": "grey",
+STATUS_COLOR = {"open": "green", "draft": "gray",
                 "merged": "purple", "closed": "red"}
-CI_CLR = {"GREEN": "green", "YELLOW": "yellow", "RED": "red", "CANCELLED": "grey", "-": "grey"}
+CI_CLR = {"GREEN": "green", "YELLOW": "yellow", "RED": "red", "CANCELLED": "gray", "-": "gray"}
 ACTION_COLOR = {"review": "me", "merge": "green", "rebase": "orange",
-                "fix ci": "red", "address": "red", "ready": "grey",
-                "wait": "yellow", "chase": "white", "done": "darkgrey",
+                "fix ci": "red", "address": "red", "ready": "gray",
+                "wait": "yellow", "chase": "white", "done": "darkgray",
                 "land": "green", "hold": "purple", "blocked": "orange",
                 "stack": "green", "update": "green", "rerun": "green"}
 ACTION_WHY = {
@@ -1011,7 +1011,7 @@ ACTION_WHY = {
     "hold": "stacked on another open PR — merge that one first (gh-stack would link them)",
     "stack": "plain stack — M links the whole chain into a native stack (gh stack link)",
     "update": "behind what it lands on — M updates the chain bottom-up first",
-    "rerun": "CI was cancelled, nothing failed — M re-runs the cancelled jobs",
+    "rerun": "CI was canceled, nothing failed — M re-runs the canceled jobs",
     "blocked": "base isn't the default branch — merge in the browser",
 }
 DECISION_LABEL = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes requested",
@@ -1022,11 +1022,11 @@ DECISION_LABEL = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes requeste
 # role here to restyle every label/value/divider/accent at once; make_palette
 # aliases each role into pal, so pal["label"] resolves like any color name.
 ROLE = {
-    "label": "grey",       # secondary text: filter/hint/column labels
+    "label": "gray",       # secondary text: filter/hint/column labels
     "value": "white",      # primary values
-    "muted": "darkgrey",   # dividers, de-emphasized text
+    "muted": "darkgray",   # dividers, de-emphasized text
     "accent": "cyan",      # repo, section headers, PR count
-    "border": "grey",      # modal/box borders
+    "border": "gray",      # modal/box borders
 }
 
 
@@ -1055,27 +1055,27 @@ ACTW = 11  # action column, right-aligned at the window edge
 
 def ci_icon(row):
     """One icon for the loudest check state: 󰅙 red any failed, 󰐾 yellow any
-    running, 󰝦 grey queued, 󰜺 grey cancelled (no result), 󰗡 green all
+    running, 󰝦 gray queued, 󰜺 gray canceled (no result), 󰗡 green all
     passed, - when no checks."""
-    passed, failed, running, queued, cancelled = row["checks"]
-    if not passed + failed + running + queued + cancelled:
-        return icon("ci_none"), "grey"
+    passed, failed, running, queued, canceled = row["checks"]
+    if not passed + failed + running + queued + canceled:
+        return icon("ci_none"), "gray"
     if failed:
         return icon("ci_fail"), "red"
     if running:
         return icon("ci_run"), "yellow"
     if queued:
-        return icon("ci_queue"), "grey"
-    if cancelled:
-        return icon("ci_cancel"), "grey"
+        return icon("ci_queue"), "gray"
+    if canceled:
+        return icon("ci_cancel"), "gray"
     return icon("ci_pass"), "green"
 
 
 def reviewer_segments(row):
     """Three fixed slots, blank-padded to REVW so they line up in every row:
     verdict — 󰔑N change-requesters (red) if any, else 󰔓N approvals (green),
-    󰔓0 dark grey when neither; pending — 󰭖N open requests, people plus
-    teams (grey, orange if any is a team or an outsider; 󰭖0 dark grey); then
+    󰔓0 dark gray when neither; pending — 󰭖N open requests, people plus
+    teams (gray, orange if any is a team or an outsider; 󰭖0 dark gray); then
     me with my state: 󰈈me requested (blue), 󰔑me changes (red), 󰔓me approved
     (green). ASCII: +N -N ?N, ?me -me +me."""
     others = [rv for rv in row["reviewers"] if not rv.get("me")]
@@ -1087,7 +1087,7 @@ def reviewer_segments(row):
     mine = next((rv for rv in row["reviewers"] if rv.get("me")), None)
 
     def slot(glyph, n, c):  # ponytail: counts cap at 9 to keep slots 2 wide
-        return (f"{icon(glyph)}{min(n, 9)}", c if n else "darkgrey")
+        return (f"{icon(glyph)}{min(n, 9)}", c if n else "darkgray")
 
     if changes:
         verdict = slot("rev_changes", len(changes), "red")
@@ -1095,7 +1095,7 @@ def reviewer_segments(row):
         verdict = slot("approve", len(approved), "green")
     odd = teams or not all(rv.get("known", True) for rv in people)
     segs = [verdict, (" ", "label"),
-            slot("rev_pending", len(people) + teams, "orange" if odd else "grey")]
+            slot("rev_pending", len(people) + teams, "orange" if odd else "gray")]
     if mine:
         glyph, c = {"pending": ("rev_requested", "mine"), "changes": ("rev_changes", "red"),
                     "approved": ("approve", "green")}[mine["state"]]
@@ -1223,8 +1223,8 @@ PLAIN_RAIL = {"▪": "▫", "├": "┆", "└": "╰"}
 
 def rail_mark(mark, row):
     """Stack rail glyph and color: native stacks solid purple, plain chains
-    (linkable with gh stack link) dashed grey."""
-    return (mark, "purple") if row.get("stack") else (PLAIN_RAIL.get(mark, mark), "grey")
+    (linkable with gh stack link) dashed gray."""
+    return (mark, "purple") if row.get("stack") else (PLAIN_RAIL.get(mark, mark), "gray")
 
 
 def print_plain(rows, errors, by):
@@ -1249,8 +1249,8 @@ def make_palette():
     has256 = curses.COLORS >= 256
     defs = {"green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW,
             "red": curses.COLOR_RED, "cyan": curses.COLOR_CYAN,
-            "grey": 245 if has256 else curses.COLOR_WHITE,
-            "darkgrey": 238 if has256 else curses.COLOR_WHITE,
+            "gray": 245 if has256 else curses.COLOR_WHITE,
+            "darkgray": 238 if has256 else curses.COLOR_WHITE,
             "purple": 135 if has256 else curses.COLOR_MAGENTA,
             "orange": 208 if has256 else curses.COLOR_YELLOW,
             "blue": 33 if has256 else curses.COLOR_BLUE,
@@ -1260,14 +1260,14 @@ def make_palette():
         curses.init_pair(i, fg, -1)
         pal[name] = curses.color_pair(i)
     if not has256:
-        pal["grey"] |= curses.A_DIM
-        pal["darkgrey"] |= curses.A_DIM
-    # the one pair with a real background: black on grey, for the help flash.
+        pal["gray"] |= curses.A_DIM
+        pal["darkgray"] |= curses.A_DIM
+    # the one pair with a real background: black on gray, for the help flash.
     # 16 is true black; color 0 follows the terminal theme and is often not.
     curses.init_pair(len(defs) + 1, 16 if has256 else curses.COLOR_BLACK,
                      245 if has256 else curses.COLOR_WHITE)
     pal["flash"] = curses.color_pair(len(defs) + 1)
-    pal["dim"] = pal["grey"]
+    pal["dim"] = pal["gray"]
     pal["me"] = pal["orange"] | curses.A_BOLD | curses.A_REVERSE  # review action
     pal["mine"] = pal["blue"] | curses.A_BOLD | curses.A_REVERSE  # me in REV
     pal["hl"] = pal["yellow"] | curses.A_BOLD | curses.A_REVERSE
@@ -1310,13 +1310,13 @@ def ask_nerd_font(stdscr, pal):
         "",
         "y = yes, use icons     n = no, use plain text",
     ]
-    safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+    safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
     for i, t in enumerate(lines):
-        safe_add(stdscr, y0 + 1 + i, x0, "│", pal["grey"])
-        safe_add(stdscr, y0 + 1 + i, x0 + mw - 1, "│", pal["grey"])
-        clr = pal["white"] | curses.A_BOLD if i in (0, 2) else pal["grey"]
+        safe_add(stdscr, y0 + 1 + i, x0, "│", pal["gray"])
+        safe_add(stdscr, y0 + 1 + i, x0 + mw - 1, "│", pal["gray"])
+        clr = pal["white"] | curses.A_BOLD if i in (0, 2) else pal["gray"]
         safe_add(stdscr, y0 + 1 + i, x0 + 1, t.center(mw - 2)[:mw - 2], clr)
-    safe_add(stdscr, y0 + 1 + len(lines), x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+    safe_add(stdscr, y0 + 1 + len(lines), x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
     stdscr.refresh()
     while True:
         k = stdscr.getch()
@@ -1523,12 +1523,12 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
         mw = max(40, min(70, width - 4))
         mh = 3 + 2 * mpad
         y0, x0 = height // 2 - mh // 2, (width - mw) // 2
-        safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+        safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
         for r in range(y0 + 1, y0 + mh - 1):
-            safe_add(stdscr, r, x0, "│", pal["grey"])
-            safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+            safe_add(stdscr, r, x0, "│", pal["gray"])
+            safe_add(stdscr, r, x0 + mw - 1, "│", pal["gray"])
         safe_add(stdscr, y0 + 1 + mpad, x0 + 1, text.center(mw - 2)[:mw - 2], pal["white"])
-        safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+        safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
         stdscr.refresh()
         while wait_key and stdscr.getch() == -1:  # getch times out (100 ms) in the TUI
             pass
@@ -1548,12 +1548,12 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             if cur >= mtop + body:
                 mtop = cur - body + 1
             stdscr.erase()
-            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
             draw_tag(stdscr, pal, y0, x0 + 2,
                      [(f" {title} ", pal["white"] | curses.A_BOLD)])
             for r in range(y0 + 1, y0 + mh - 1):
-                safe_add(stdscr, r, x0, "│", pal["grey"])
-                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+                safe_add(stdscr, r, x0, "│", pal["gray"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["gray"])
             for i in range(body):
                 idx, yy = mtop + i, y0 + 1 + mpad + i
                 if idx >= len(items):
@@ -1564,14 +1564,14 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                 safe_add(stdscr, yy, x0 + 1,
                          f" {mark}{items[idx]}".ljust(mw - 2)[:mw - 2],
                          pal["white"] | attr)
-            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
             hints = ([(keycap("space"), "toggle")] if checked is not None else []) + \
                 [(keycap("enter"), "ok"), (keycap("esc"), "cancel")]
             hx = x0 + 2
             for kh, lb in hints:
                 hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
                               [(f" {kh} ", pal["white"] | curses.A_BOLD),
-                               (f"{lb} ", pal["grey"])])
+                               (f"{lb} ", pal["gray"])])
             stdscr.refresh()
             k = stdscr.getch()
             if k in (27, curses.KEY_LEFT):
@@ -1609,13 +1609,13 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             if cur >= mtop + body:
                 mtop = cur - body + 1
             stdscr.erase()
-            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
             draw_tag(stdscr, pal, y0, x0 + 2,
                      [(f" repos in {icon('org')} {org} " if NF
                        else f" repos in {org} ", pal["white"] | curses.A_BOLD)])
             for r in range(y0 + 1, y0 + mh - 1):
-                safe_add(stdscr, r, x0, "│", pal["grey"])
-                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+                safe_add(stdscr, r, x0, "│", pal["gray"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["gray"])
             for i in range(body):
                 idx, yy = mtop + i, y0 + 1 + mpad + i
                 if idx >= len(names):
@@ -1631,12 +1631,12 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                          f"{m['short']:<3}"[:3], pal["cyan"] | rv["name"])
                 safe_add(stdscr, yy, x0 + mw - 18,
                          f"{glyph} {m['icon'] or '-':<13}"[:16], pal["cyan"] | rv["icon"])
-            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
             hx = x0 + 2
             for kh, lb in hints[level]:
                 hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
                               [(f" {kh} ", pal["white"] | curses.A_BOLD),
-                               (f"{lb} ", pal["grey"])])
+                               (f"{lb} ", pal["gray"])])
             if level == "icon" and filt:
                 draw_tag(stdscr, pal, y0 + mh - 1, hx, [(f" /{filt} ", pal["purple"])])
             stdscr.refresh()
@@ -1753,11 +1753,11 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             mh = min(len(lines) + 2 + 2 * mpad, height - 2)
             y0, x0 = (height - mh) // 2, (width - mw) // 2
             stdscr.erase()
-            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
             draw_tag(stdscr, pal, y0, x0 + 2, [(" keys ", pal["white"] | curses.A_BOLD)])
             for r in range(y0 + 1, y0 + mh - 1):
-                safe_add(stdscr, r, x0, "│", pal["grey"])
-                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+                safe_add(stdscr, r, x0, "│", pal["gray"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["gray"])
             visible = lines[:mh - 2 - 2 * mpad]
             for i, (kind, k, desc, _) in enumerate(visible):
                 yy = y0 + 1 + mpad + i
@@ -1768,19 +1768,19 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                              f"─ {k} " + "─" * max(0, mw - 8 - len(k)),
                              pal["muted"])  # same divider color as detail modal
                 else:
-                    # flash: black on grey across the full inner width
+                    # flash: black on gray across the full inner width
                     fl = i in flash_ix and now < flash_until
                     if fl:
                         safe_add(stdscr, yy, x0 + 1, " " * (mw - 2), pal["flash"])
-                    # no bold on the band: terminals render bold black as grey
+                    # no bold on the band: terminals render bold black as gray
                     safe_add(stdscr, yy, x0 + 2, f"{k:>9}",
                              pal["flash"] if fl else pal["white"] | curses.A_BOLD)
                     safe_add(stdscr, yy, x0 + 13, desc[:mw - 15],
-                             pal["flash"] if fl else pal["grey"])
-            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+                             pal["flash"] if fl else pal["gray"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
             draw_tag(stdscr, pal, y0 + mh - 1, x0 + 2,
                      [(" press q again to close ", pal["orange"] | curses.A_BOLD)]
-                     if now - q_at < 2 else [(" q closes ", pal["grey"])])
+                     if now - q_at < 2 else [(" q closes ", pal["gray"])])
             stdscr.refresh()
             # the modal now holds until qq, so keep the schedules alive
             if (auto_on and refresh_s and not state["pending"]
@@ -1877,7 +1877,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                                "orange" if row["comments"][0] else
                                "green" if row["comments"][2] else "label")]),
                 ("ci", [(f"{ci_g} {row['ci']}   {p} passed, {f} failed, "
-                         f"{r} running, {q} queued" + (f", {cx} cancelled" if cx else ""), ci_c)]),
+                         f"{r} running, {q} queued" + (f", {cx} canceled" if cx else ""), ci_c)]),
                 ("action", [(f"{icon(row['action'])} {row['action']}",
                              "green" if row["action"] == "done"
                              else ACTION_COLOR[row["action"]]),
@@ -2016,12 +2016,12 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             mh = max(4, min(len(auths) + 2 + 2 * mpad, height - 2))
             y0, x0 = (height - mh) // 2, (width - mw) // 2
             stdscr.erase()
-            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
             draw_tag(stdscr, pal, y0, x0 + 2,
                      [(" authors ", pal["white"] | curses.A_BOLD)])
             for r in range(y0 + 1, y0 + mh - 1):
-                safe_add(stdscr, r, x0, "│", pal["grey"])
-                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+                safe_add(stdscr, r, x0, "│", pal["gray"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["gray"])
             for i, a in enumerate(auths[:mh - 2 - 2 * mpad]):
                 yy = y0 + 1 + mpad + i
                 sel = i == cur
@@ -2033,12 +2033,12 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                          pal["cyan"] | rv["tag"])
                 safe_add(stdscr, yy, x0 + 47, "me" if a["me"] else "  ",
                          pal["orange"] | curses.A_BOLD)
-            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
             hx = x0 + 2
             for kh, lb in hints[level]:
                 hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
                               [(f" {kh} ", pal["white"] | curses.A_BOLD),
-                               (f"{lb} ", pal["grey"])])
+                               (f"{lb} ", pal["gray"])])
             stdscr.refresh()
             k = stdscr.getch()
             a = auths[cur] if auths else None
@@ -2109,12 +2109,12 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
             mh = len(SETTINGS) + 2 + 2 * mpad
             y0, x0 = (height - mh) // 2, (width - mw) // 2
             stdscr.erase()
-            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["grey"])
+            safe_add(stdscr, y0, x0, "┌" + "─" * (mw - 2) + "┐", pal["gray"])
             draw_tag(stdscr, pal, y0, x0 + 2,
                      [(" settings ", pal["white"] | curses.A_BOLD)])
             for r in range(y0 + 1, y0 + mh - 1):
-                safe_add(stdscr, r, x0, "│", pal["grey"])
-                safe_add(stdscr, r, x0 + mw - 1, "│", pal["grey"])
+                safe_add(stdscr, r, x0, "│", pal["gray"])
+                safe_add(stdscr, r, x0 + mw - 1, "│", pal["gray"])
             for i, (k, kind, dflt, desc) in enumerate(SETTINGS):
                 yy = y0 + 1 + mpad + i
                 shown = (edit + "_") if (edit is not None and i == cur) \
@@ -2122,15 +2122,15 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
                 attr = curses.A_REVERSE if i == cur else 0
                 safe_add(stdscr, yy, x0 + 2, f" {k:<17}", pal["white"] | attr)
                 safe_add(stdscr, yy, x0 + 20, f"{shown:<7}", pal["cyan"] | attr)
-                safe_add(stdscr, yy, x0 + 28, desc[:mw - 30], pal["grey"])
-            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["grey"])
+                safe_add(stdscr, yy, x0 + 28, desc[:mw - 30], pal["gray"])
+            safe_add(stdscr, y0 + mh - 1, x0, "└" + "─" * (mw - 2) + "┘", pal["gray"])
             hx = x0 + 2
             for kh, lb in ((keycap("up_down"), "move"),
                            (f"{keycap('enter')}/{keycap('space')}", "edit/toggle"),
                            (keycap("esc"), "close")):
                 hx = draw_tag(stdscr, pal, y0 + mh - 1, hx,
                               [(f" {kh} ", pal["white"] | curses.A_BOLD),
-                               (f"{lb} ", pal["grey"])])
+                               (f"{lb} ", pal["gray"])])
             stdscr.refresh()
             k = stdscr.getch()
             key_name, kind, dflt, _ = SETTINGS[cur]
@@ -2427,15 +2427,15 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
         modal_msg(msg, wait_key=True)
 
     def rerun_flow(repo, slug, row):
-        """Re-run the cancelled jobs of each workflow whose newest run was
-        cancelled (gh run rerun --failed: failed and cancelled jobs and what
+        """Re-run the canceled jobs of each workflow whose newest run was
+        canceled (gh run rerun --failed: failed and canceled jobs and what
         depends on them), after a y confirm; then refresh the PR."""
         runs = row["rerun"]
         if not runs:
-            modal_msg(f"#{row['number']}: no cancelled run found", wait_key=True)
+            modal_msg(f"#{row['number']}: no canceled run found", wait_key=True)
             return
         val, lab, warn = pal["value"], pal["label"], pal["orange"]
-        lines = [[(row["title"], val)], [], [("re-run the cancelled jobs of:", lab)]]
+        lines = [[(row["title"], val)], [], [("re-run the canceled jobs of:", lab)]]
         lines += [[(f"  {wf} ", val), (f"run {rid}", lab)] for rid, wf in runs.items()]
         lines.append([("starts CI that others see and that costs Actions minutes", lab)])
         if not row["mine"]:
@@ -2681,7 +2681,7 @@ def tui(stdscr, cfg, cfg_path, show_all, refresh_s, wait_s):
         border, bold = pal["border"], curses.A_BOLD
 
         keymode = show_keys or time.time() < peek_until
-        # nerd font off: labels always lead with the trigger key (grey at rest,
+        # nerd font off: labels always lead with the trigger key (gray at rest,
         # bold when peeking); with nerd font: icon at rest, bold key on peek
         lead = (pal["value"] | bold) if keymode else pal["label"]
 
@@ -2951,15 +2951,15 @@ def selftest():
     stale["contexts"]["nodes"].pop()
     assert ci_of(stale) == ("GREEN", [1, 0, 0, 0, 0])
     assert ci_of({"state": "PENDING"}) == ("YELLOW", [0, 0, 0, 0, 0])  # no contexts: rollup state
-    cancelled = {"state": "FAILURE", "contexts": {"nodes": [  # run cancelled before its matrix expanded
+    canceled = {"state": "FAILURE", "contexts": {"nodes": [  # run canceled before its matrix expanded
         run("Tests (${{ matrix.shard.name }})", "CANCELLED", "2026-10-05T13:31:39Z", wf="CI", num=18415),
         run("Tests (aqua | trx)", "SUCCESS", "2026-10-05T13:36:09Z", wf="CI", num=18416)]}}
-    assert ci_of(cancelled) == ("GREEN", [1, 0, 0, 0, 0])
-    cut = {"state": "FAILURE", "contexts": {"nodes": [  # newest run cancelled, nothing after it
+    assert ci_of(canceled) == ("GREEN", [1, 0, 0, 0, 0])
+    cut = {"state": "FAILURE", "contexts": {"nodes": [  # newest run canceled, nothing after it
         run("Build", "CANCELLED", "2026-10-05T13:31:39Z", wf="CI", num=7), run("Lint", "SUCCESS", "t", wf="Lint")]}}
     assert ci_of(cut) == ("CANCELLED", [1, 0, 0, 0, 1]) and rerun_ids(cut) == {907: "CI"}
     cut["contexts"]["nodes"].append(run("Unit", "FAILURE", "t", wf="Unit"))
-    assert ci_of(cut)[0] == "RED"  # a real failure outranks a cancelled run
+    assert ci_of(cut)[0] == "RED"  # a real failure outranks a canceled run
     assert gh_transient("gh: HTTP 502") == "retry" and gh_transient("HTTP 504: Gateway Timeout") == "retry"
     assert gh_transient("You have exceeded a secondary rate limit") == "limit"
     assert gh_transient("unexpected end of JSON input") == "retry"
@@ -2999,10 +2999,10 @@ def selftest():
     assert row["checks"] == [3, 0, 0, 0, 0], row
     assert ci_icon(row) == (icon("ci_pass"), "green")
     assert ci_icon({"checks": [9, 2, 0, 0, 0]}) == (icon("ci_fail"), "red")
-    assert ci_icon({"checks": [4, 0, 0, 0, 3]}) == (icon("ci_cancel"), "grey")
+    assert ci_icon({"checks": [4, 0, 0, 0, 3]}) == (icon("ci_cancel"), "gray")
     assert ci_icon({"checks": [1, 0, 9, 0, 0]}) == (icon("ci_run"), "yellow")
-    assert ci_icon({"checks": [1, 0, 0, 3, 0]}) == (icon("ci_queue"), "grey")
-    assert ci_icon({"checks": [0, 0, 0, 0, 0]}) == ("-", "grey")
+    assert ci_icon({"checks": [1, 0, 0, 3, 0]}) == (icon("ci_queue"), "gray")
+    assert ci_icon({"checks": [0, 0, 0, 0, 0]}) == ("-", "gray")
     # esc/enter/space print the same symbol with or without a nerd font
     assert keycap("esc", False) == keycap("esc", True) == "␛"
     assert keycap("x", True) == "x"  # unlisted key resolves to itself
@@ -3165,8 +3165,8 @@ def selftest():
     assert fuzzy_match("14", fr) and fuzzy_match("ABC-14", fr)  # short = prefix
     assert fuzzy_match("1", fr) and fuzzy_match("ab", fr)       # never blank early
     assert not fuzzy_match("xyz9", fr)
-    assert highlight_segs([("feat/ABC-142 x", "grey")], match_pattern("142")) == \
-        [("feat/", "grey"), ("ABC-142", "hl"), (" x", "grey")]
+    assert highlight_segs([("feat/ABC-142 x", "gray")], match_pattern("142")) == \
+        [("feat/", "gray"), ("ABC-142", "hl"), (" x", "gray")]
     assert match_pattern("widget").search("a Widget chat")
     f2 = {"number": 14116, "branch": "feat/ABC-161", "title": "ABC-161 Unlock"}
     assert not fuzzy_match("116", f2)  # 3+ digits: exact ticket, no #14116 bleed

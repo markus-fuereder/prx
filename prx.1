@@ -11,9 +11,9 @@ YAML config file in one flat table, sortable by repo or author. For each PR it
 shows the repo, PR number, author, CI state, reviewers with their review
 state, a recommended action, the head branch, and the title. The TUI uses Nerd
 Font glyphs (octicons), GitHub-style: a pull-request/merge icon colored by
-status (open green, draft grey, merged purple, closed red), a filled CI dot
-(green/yellow/red, grey when no checks), per-reviewer check marks (green
-approved, grey pending, red x for changes requested), and a branch icon.
+status (open green, draft gray, merged purple, closed red), a filled CI dot
+(green/yellow/red, gray when no checks), per-reviewer check marks (green
+approved, gray pending, red x for changes requested), and a branch icon.
 A Nerd Font is recommended for the TUI. On first run prx asks whether the
 sample glyphs render; the answer is saved as \fInerd_font\fR in the config. With
 \fInerd_font: false\fR the TUI uses plain text instead (status \fB○ · ● ×\fR,
@@ -139,9 +139,9 @@ Verdict: red thumb-down with the change-requester count if anyone requested
 changes (\fB-N\fR without a nerd font), else green thumb-up with the approval
 count (\fB+N\fR; approvers are never named, your own approval included).
 Pending: person-with-clock with the number of open review requests, people and
-teams together (\fB?N\fR; grey, orange when any is a team or an outsider — not
+teams together (\fB?N\fR; gray, orange when any is a team or an outsider — not
 a configured author; teams would need the read:org scope to be named). A zero
-count shows dark grey (\fB+0\fR, \fB?0\fR). Last, \fBme\fR with your own
+count shows dark gray (\fB+0\fR, \fB?0\fR). Last, \fBme\fR with your own
 state when you are a reviewer: eye when your review is requested (\fB?me\fR,
 blue highlight), thumb-down when you requested changes (\fB-me\fR, red),
 thumb-up when you approved (\fB+me\fR, green). "You" is the author entry with
@@ -165,16 +165,16 @@ Head branch of the PR.
 .TP
 .B CI
 TUI: one icon for the loudest state of the head commit's checks — red filled
-✗-circle if any failed, yellow radio dot if any running, grey hollow circle if
-only queued, grey cancel sign if a check was cancelled (CI never finished), green
-outlined ✓-circle if all passed, grey \- when no checks.
+✗-circle if any failed, yellow radio dot if any running, gray hollow circle if
+only queued, gray cancel sign if a check was canceled (CI never finished), green
+outlined ✓-circle if all passed, gray \- when no checks.
 Plain/JSON: the combined state as GREEN/YELLOW/RED/CANCELLED (\- when no
-checks), plus a \fIchecks\fR field [passed, failed, running, queued, cancelled]
-in JSON. A cancelled check is no result, not a failure: CANCELLED unless
+checks), plus a \fIchecks\fR field [passed, failed, running, queued, canceled]
+in JSON. A canceled check is no result, not a failure: CANCELLED unless
 something failed or still runs. A check that ran
 more than once on the same commit (a re-run, a label event) counts only with
 its newest run: per GitHub Actions workflow only its newest run counts (a run
-cancelled before its matrix expanded has different job names), then per
+canceled before its matrix expanded has different job names), then per
 check name its newest start \(em the way GitHub's PR page shows it; GitHub's own combined status still counts the stale runs, so a PR whose
 old run failed and whose re-run passed is green here and on the PR page.
 .TP
@@ -187,8 +187,8 @@ The next move (icon + word in the TUI), first match wins:
 .B fix ci
 = a check failed;
 .B rerun
-= CI was cancelled and nothing failed: no code to fix, the run has to run again
-(\fBM\fR re-runs the cancelled jobs with \fBgh run rerun --failed\fR after a
+= CI was canceled and nothing failed: no code to fix, the run has to run again
+(\fBM\fR re-runs the canceled jobs with \fBgh run rerun --failed\fR after a
 \fBy\fR confirm; it starts CI others see and that costs Actions minutes);
 .B address
 = changes requested;
@@ -240,7 +240,7 @@ their root and marked in a purple rail column left of the PR number:
 \fB▪\fR root, \fB├\fR member, \fB└\fR last member. In repo/author sort, rows keep pure sort order and every
 stack member shows a plain \fB▪\fR instead. Native GitHub stacks keep the solid
 purple rail; plain stacks (not linked yet, see the \fIstack\fR action) show a
-dashed grey one: \fB▫\fR, \fB┆\fR, \fB╰\fR. If the parent is not visible
+dashed gray one: \fB▫\fR, \fB┆\fR, \fB╰\fR. If the parent is not visible
 (merged, filtered out), the child appears as a normal row. \fB--json\fR output
 carries the \fIbase\fR branch per PR.
 .SH TUI KEYS
@@ -347,7 +347,7 @@ false; also in the \fB,\fR settings modal).
 .TP
 .B Loading line
 While a fetch for a wider scope runs (start-up, or a filter change that needs
-data not loaded yet, including the 3 s debounce before it starts), a dark grey
+data not loaded yet, including the 3 s debounce before it starts), a dark gray
 line under the last row shows a spinner, the scope, and the repos still in
 flight, e.g. \fI⠼ loading month · FE, DE\fR. Plain syncs don't show it.
 .TP
@@ -390,7 +390,7 @@ The footer confirms with \fIcopied …\fR. Uses \fBpbcopy\fR, \fBwl-copy\fR or
 .TP
 .B j / k / arrows
 Move selection. When rows don't fit, the first or last visible line turns into
-a dark grey \fI↑ N more\fR / \fI↓ N more\fR marker for the rows hidden in that
+a dark gray \fI↑ N more\fR / \fI↓ N more\fR marker for the rows hidden in that
 direction; the list scrolls so the selection never sits under a marker.
 .TP
 .B Enter
